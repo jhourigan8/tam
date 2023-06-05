@@ -1,9 +1,0 @@
-C:\Users\jacke\Desktop\tammany\target\debug\deps\rnglib-e266d5f0f5116a30.rmeta: C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src/lib.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_joiner.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_syllable.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_syllables.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_weighted_rnd.rs
-
-C:\Users\jacke\Desktop\tammany\target\debug\deps\rnglib-e266d5f0f5116a30.d: C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src/lib.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_joiner.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_syllable.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_syllables.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_weighted_rnd.rs
-
-C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src/lib.rs:
-C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_joiner.rs:
-C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_syllable.rs:
-C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_syllables.rs:
-C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\random_name_generator-0.3.4\src\rng_weighted_rnd.rs:
