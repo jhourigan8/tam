@@ -1,105 +1,15 @@
-use blst::{self, BLST_ERROR};
-use ed25519_dalek::{self, Verifier, Signer};
 use either::Either;
-use rand::Rng;
 use sha2::{Sha256, Digest};
-use serde::{Serialize, Deserialize};
-use std::{fmt::Debug, collections::HashMap};
-use serde_big_array::BigArray;
-use rand::rngs::OsRng;
 
 use crate::merkle::MerkleMap;
+use crate::account::{self, Signed};
+use crate::validator;
+use crate::txn::Txn;
 
-const VALIDATOR_SLOTS: u32 = 256;
-const VALIDATOR_STAKE: u32 = 1024;
-const MAX_FORK: u32 = 128;
-const VALIDATOR_ROOT: [u8; 32] = [0u8; 32];
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct AccountData {
-    pub bal: u32,
-    pub nonce: u32
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StakeData {
-    round: u32,
-    owner: ed25519_dalek::PublicKey,
-    #[serde(with = "BigArray")]
-    validator: [u8; 96] // bls pk bytes
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Txn {
-    #[serde(with = "BigArray")]
-    pub to: [u8; 32], // account
-    pub amount: u32,
-    pub nonce: u32,
-    pub data: HashMap<String, Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Signed<T> {
-    pub msg: T,
-    pub from: ed25519_dalek::PublicKey,
-    pub sig: ed25519_dalek::Signature
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Keypair {
-    pub kp: ed25519_dalek::Keypair
-}
-
-impl Keypair {
-    pub fn gen() -> Self {
-        let mut csprng = OsRng {};
-        Self { kp: ed25519_dalek::Keypair::generate(&mut csprng) }
-    }
-
-    fn sign<T: Serialize>(&self, msg: &T) -> ed25519_dalek::Signature {
-        self.kp.sign(&serde_json::to_string(&msg).expect("").as_bytes())
-    }
-
-    pub fn send(&self, to: ed25519_dalek::PublicKey, amount: u32, state: &State) -> Signed<Txn> {
-        let msg = Txn {
-            to: Sha256::digest(to).into(),
-            amount,
-            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().nonce,
-            data: HashMap::default()
-        };
-        let sig = self.sign(&msg);
-        Signed::<Txn> {
-            msg,
-            from: self.kp.public.clone(),
-            sig
-        }
-    }
-
-    fn stake(&self, validator: blst::min_sig::PublicKey, state: &State) -> Signed<Txn> {
-        let mut rng = rand::thread_rng();
-        let idx = loop {
-            let rand = rng.gen::<u32>() % VALIDATOR_SLOTS;
-            if state.validators.get(&rand.to_be_bytes()).is_none() {
-                break rand;
-            }
-        };
-        let mut data = HashMap::default();
-        data.insert(String::from("idx"), Vec::from(idx.to_be_bytes()));
-        data.insert(String::from("validator"), validator.to_bytes().to_vec());
-        let msg = Txn {
-            to: VALIDATOR_ROOT,
-            amount: VALIDATOR_STAKE,
-            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().nonce,
-            data
-        };
-        let sig = self.sign(&msg);
-        Signed::<Txn> {
-            msg,
-            from: self.kp.public.clone(),
-            sig
-        }
-    }
-}
+pub const VALIDATOR_ROOT: account::Account = [0u8; 32];
+pub const VALIDATOR_SLOTS: u32 = 256;
+pub const VALIDATOR_STAKE: u32 = 1024;
+const _MAX_FORK: u32 = 128;
 
 #[derive(Debug, Clone)]
 pub struct BlockBuilder {
@@ -122,8 +32,8 @@ impl BlockBuilder {
 
 #[derive(Debug, Clone)]
 pub struct State {
-    pub accounts: MerkleMap<AccountData>,
-    pub validators: MerkleMap<StakeData>,
+    pub accounts: MerkleMap<account::Data>,
+    pub validators: MerkleMap<validator::Data>,
     pub round: u32,
     pub seed: [u8; 32]
 }
@@ -142,12 +52,12 @@ pub enum TxnError {
 }
 
 impl State {
-    fn verify(&self, stxn: &Signed<Txn>) -> Result<([u8; 32], AccountData, Either<AccountData, ([u8; 4], StakeData)>), TxnError> {
+    fn verify(&self, stxn: &Signed<Txn>) -> Result<([u8; 32], account::Data, Either<account::Data, ([u8; 4], validator::Data)>), TxnError> {
         let from_addy: [u8; 32] = Sha256::digest(&stxn.from.to_bytes()).into();
         let mut from_account = self.accounts.get(&from_addy)
             .ok_or(TxnError::BadFromPk)?
             .clone();
-        if !stxn.from.verify(serde_json::to_string(&stxn.msg).expect("").as_bytes(), &stxn.sig).is_ok() {
+        if !stxn.verify() {
             return Err(TxnError::BadSig);
         }
         /* --- from old bls ---
@@ -199,7 +109,7 @@ impl State {
                 from_account, 
                 Either::Right((
                     idx,
-                    StakeData { 
+                    validator::Data { 
                         round: self.round, 
                         owner: stxn.from.clone(), 
                         validator: validator_pk.to_bytes()
@@ -218,7 +128,7 @@ impl State {
                     Ok((from_addy, from_account, Either::Left(to_account)))
                 }
                 None => {
-                    Ok((from_addy, from_account, Either::Left(AccountData { bal: stxn.msg.amount, nonce: 0 })))
+                    Ok((from_addy, from_account, Either::Left(account::Data { bal: stxn.msg.amount, nonce: 0 })))
                 }
             }
         }
@@ -243,65 +153,7 @@ impl State {
     }
 
     pub fn validators<'a> (&'a self) -> impl Iterator<Item = blst::min_sig::PublicKey> + 'a { // impl Iterator<Item = PublicKey> + 'a {
-        ValidatorIter { seed: self.seed, validators: &self.validators }
-    }
-}
-
-struct ValidatorIter<'a> {
-    seed: [u8; 32],
-    validators: &'a MerkleMap<StakeData>,
-}
-
-impl<'a> Iterator for ValidatorIter<'a> {
-    type Item = blst::min_sig::PublicKey;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let idx = ValidatorIter::idx_from_seed(&self.seed);
-            self.seed = Sha256::digest(&self.seed).into();
-            let from_account = self.validators.get(&idx.to_be_bytes());
-            if let Some(ref k) = from_account {
-                let from_pk = blst::min_sig::PublicKey::from_bytes(&k.validator);
-                if let Ok(pk) = from_pk {
-                    return Some(pk);
-                }
-            }
-        }
-    }
-}
-
-impl<'a> ValidatorIter<'a> {
-    fn rand_from_seed(seed: &[u8]) -> u64 {
-        u64::from_be_bytes(
-            Sha256::digest(seed)[..8]
-            .try_into()
-            .expect("sha256 output is more than 8 bytes")
-        )
-    }
-
-    fn idx_from_seed(seed: &[u8]) -> u32 {
-        ((Self::rand_from_seed(seed) as f64 / u64::MAX as f64) * VALIDATOR_SLOTS as f64).floor() as u32
-    }
-}
-
-pub mod Validator {
-    use serde::Serialize;
-    use crate::state::Signed;
-    use rand::Rng;
-
-    #[derive(Debug, Clone)]
-    pub struct Keypair {
-        pub sk: blst::min_sig::SecretKey,
-        pub pk: blst::min_sig::PublicKey,
-    }
-
-    impl Keypair {
-        pub fn gen() -> Self {
-            let mut rng = rand::thread_rng();
-            let seed: [u8; 32] = core::array::from_fn(|_| rng.gen());
-            let sk = blst::min_sig::SecretKey::key_gen(&seed, &[]).unwrap();
-            Self { sk: sk.clone(), pk: sk.sk_to_pk() }
-        }
+        validator::ValidatorIter { seed: self.seed, validators: &self.validators }
     }
 }
 
@@ -309,8 +161,8 @@ pub mod Validator {
 pub mod tests {
     use super::*;
 
-    pub fn setup() -> (Keypair, BlockBuilder) {
-        let alice = Keypair::gen();
+    pub fn setup() -> (account::Keypair, BlockBuilder) {
+        let alice = account::Keypair::gen();
         let mut state = State {
             accounts: MerkleMap::default(),
             validators: MerkleMap::default(),
@@ -319,7 +171,7 @@ pub mod tests {
         };
         state.accounts.insert(
             &Sha256::digest(alice.kp.public.to_bytes()),
-            AccountData { bal: 1 << 17, nonce: 0 }
+            account::Data { bal: 1 << 17, nonce: 0 }
         );
         let builder = BlockBuilder {
             txnseq: MerkleMap::<Signed<Txn>>::default(),
@@ -333,8 +185,8 @@ pub mod tests {
     fn payments() {
         let (alice, mut builder) = setup();
         let old = builder.state.clone();
-        let bob = Keypair::gen();
-        let charlie = Keypair::gen();
+        let bob = account::Keypair::gen();
+        let charlie = account::Keypair::gen();
         assert!(
             builder.add(
                 alice.send(bob.kp.public, 1 << 15, &builder.state)
@@ -365,36 +217,34 @@ pub mod tests {
             )
             .is_ok()
         );
-        let old_accs = old.accounts.iter().collect::<Vec<&AccountData>>();
-        assert!(old_accs.contains(&&AccountData { bal: (1 << 17), nonce: 0 })); // alice
-        let new_accs = builder.state.accounts.iter().collect::<Vec<&AccountData>>();
+        let old_accs = old.accounts.iter().collect::<Vec<&account::Data>>();
+        assert!(old_accs.contains(&&account::Data { bal: (1 << 17), nonce: 0 })); // alice
+        let new_accs = builder.state.accounts.iter().collect::<Vec<&account::Data>>();
         println!("{:?}", new_accs);
-        assert!(new_accs.contains(&&AccountData { bal: (1 << 17) - (1 << 15) - (1 << 5) - (1 << 8), nonce: 3 })); // alice
-        assert!(new_accs.contains(&&AccountData { bal: (1 << 15) + (1 << 5) + (1 << 8), nonce: 1 })); // bob
-        assert!(new_accs.contains(&&AccountData { bal: 0, nonce: 1 })); // charlie
+        assert!(new_accs.contains(&&account::Data { bal: (1 << 17) - (1 << 15) - (1 << 5) - (1 << 8), nonce: 3 })); // alice
+        assert!(new_accs.contains(&&account::Data { bal: (1 << 15) + (1 << 5) + (1 << 8), nonce: 1 })); // bob
+        assert!(new_accs.contains(&&account::Data { bal: 0, nonce: 1 })); // charlie
     }
 
     #[test]
     fn validators() {
         let (alice, mut builder) = setup();
-        let bob = Keypair::gen();
+        let bob = account::Keypair::gen();
         println!("{:?}", builder.add(
             alice.send(bob.kp.public, 1 << 15,  &builder.state)
         ));
-        let alice_val = Validator::Keypair::gen();
+        let alice_val = validator::Keypair::gen();
         for _ in 0..64 {
             println!("{:?}", builder.add(
                 alice.stake(alice_val.pk, &builder.state)
             ));
         }
-        let bob_val = Validator::Keypair::gen();
+        let bob_val = validator::Keypair::gen();
         for _ in 64..80 {
-            builder.add(
-                bob.stake(bob_val.pk, &builder.state)
-            );
+            assert!(builder.add(bob.stake(bob_val.pk, &builder.state)).is_ok());
         }
         println!("{:?}", builder.state);
-        println!("{:?}", builder.state.validators.iter().collect::<Vec<&StakeData>>());
+        println!("{:?}", builder.state.validators.iter().collect::<Vec<&validator::Data>>());
         assert_eq!(builder.state.validators.iter().filter(|s| s.owner == alice.kp.public).count(), 64);
         assert_eq!(builder.state.validators.iter().filter(|s| s.owner == bob.kp.public).count(), 16);
         let mut val_iter = builder.state.validators();
