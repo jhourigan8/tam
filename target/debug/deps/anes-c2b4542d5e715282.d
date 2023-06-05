@@ -1,0 +1,12 @@
+C:\Users\jacke\Desktop\tammany\target\debug\deps\anes-c2b4542d5e715282.rmeta: C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\lib.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\macros.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\attribute.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\buffer.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\color.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\cursor.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\terminal.rs
+
+C:\Users\jacke\Desktop\tammany\target\debug\deps\anes-c2b4542d5e715282.d: C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\lib.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\macros.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\attribute.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\buffer.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\color.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\cursor.rs C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\terminal.rs
+
+C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\lib.rs:
+C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\macros.rs:
+C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences.rs:
+C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\attribute.rs:
+C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\buffer.rs:
+C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\color.rs:
+C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\cursor.rs:
+C:\Users\jacke\.cargo\registry\src\github.com-1ecc6299db9ec823\anes-0.1.6\src\sequences\terminal.rs:
