@@ -18,7 +18,6 @@ use std::fmt::Debug;
 
 pub mod merkle;
 pub mod state;
-pub mod merkletmp;
 
 /*
 

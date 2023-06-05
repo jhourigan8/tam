@@ -6,87 +6,36 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use sha2::{Sha256, Digest};
 
 fn merkle_map(crit: &mut Criterion) {
-    let mut node_copy: tammany::merkletmp::MerkleMap<usize> = tammany::merkletmp::MerkleMap::default();
+    let mut node_copy: MerkleMap<usize> = MerkleMap::default();
     crit.bench_function("merkle map copy insert 10k", |b| b.iter(|| {
         for i in 1usize..10_000 {
             node_copy.insert(&i.to_be_bytes(), i);
         }
     }));
 
-    crit.bench_function("merkle map copy get 10k", |b| b.iter(|| {
+    crit.bench_function("merkle map get 10k", |b| b.iter(|| {
         for i in 1usize..10_000 {
             node_copy.get(&i.to_be_bytes());
         }
     }));
 
-    crit.bench_function("merkle map copy iter 10k", |b| b.iter(|| {
+    crit.bench_function("merkle map iter 10k", |b| b.iter(|| {
         let mut sum = 0;
         for val in node_copy.iter() {
             sum += val;
         }
     }));
 
-    crit.bench_function("merkle map copy search 10k", |b| b.iter(|| {
-        let mut sum = 0;
-        for i in 1usize..10_000 {
-            if let Some(_) = node_copy.search(|k, _| match k.last() {
-                Some(x) => x % 16 == (i & 0xff) as u8,
-                None => true
-            }) {
-                sum += 1;
-            }
-        }
-    }));
-
-    crit.bench_function("merkle map copy remove 10k", |b| b.iter(|| {
+    crit.bench_function("merkle map remove 10k", |b| b.iter(|| {
         for i in 1usize..10_000 {
             node_copy.remove(&i.to_be_bytes());
         }
     }));
 
-    let mut node: MerkleMap<Sha256, usize> = MerkleMap::default();
-    crit.bench_function("merkle map insert 10k", |b| b.iter(|| {
-        for i in 1usize..10_000 {
-            node.insert(&i.to_be_bytes(), i);
-        }
-        node.commit();
-    }));
-
-    crit.bench_function("merkle map get 10k", |b| b.iter(|| {
-        for i in 1usize..10_000 {
-            node.get(&i.to_be_bytes());
-        }
-    }));
-
-    crit.bench_function("merkle map iter 10k", |b| b.iter(|| {
-        let mut sum = 0;
-        for val in node.iter() {
-            sum += val;
-        }
-    }));
-
-    crit.bench_function("merkle map search 10k", |b| b.iter(|| {
-        let mut sum = 0;
-        for i in 1usize..10_000 {
-            if let Some(_) = node.search(|k, _| match k.last() {
-                Some(x) => x % 16 == (i & 0xff) as u8,
-                None => true
-            }) {
-                sum += 1;
-            }
-        }
-    }));
-
-    crit.bench_function("merkle map remove 10k", |b| b.iter(|| {
-        for i in 1usize..10_000 {
-            node.remove(&i.to_be_bytes());
-        }
-        node.commit();
-    }));
     let alice = Keypair::gen();
     let mut state = State {
-        accounts: tammany::merkletmp::MerkleMap::default(),
-        validators: tammany::merkletmp::MerkleMap::default(),
+        accounts: MerkleMap::default(),
+        validators: MerkleMap::default(),
         round: 0,
         seed: [0u8; 32]
     };

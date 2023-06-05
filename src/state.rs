@@ -8,7 +8,7 @@ use std::{fmt::Debug, collections::HashMap};
 use serde_big_array::BigArray;
 use rand::rngs::OsRng;
 
-use crate::merkletmp::MerkleMap;
+use crate::merkle::MerkleMap;
 
 const VALIDATOR_SLOTS: u32 = 256;
 const VALIDATOR_STAKE: u32 = 1024;
