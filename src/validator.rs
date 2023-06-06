@@ -7,6 +7,7 @@ use serde_big_array::BigArray;
 
 use crate::{account, merkle::MerkleMap, state::VALIDATOR_SLOTS};
 
+pub type Slot = [u8; 4];
 pub type PublicKey = blst::min_sig::PublicKey;
 pub type SecretKey = blst::min_sig::SecretKey;
 pub type Signature = blst::min_sig::Signature;

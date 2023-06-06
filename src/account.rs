@@ -10,6 +10,7 @@ use crate::txn::Txn;
 
 pub type Account = [u8; 32];
 pub type PublicKey = ed25519_dalek::PublicKey;
+pub type SecretKey = ed25519_dalek::SecretKey;
 pub type Signature = ed25519_dalek::Signature;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -29,7 +30,7 @@ impl Keypair {
         Self { kp: ed25519_dalek::Keypair::generate(&mut csprng) }
     }
 
-    fn sign<T: Serialize>(&self, msg: &T) -> Signature {
+    pub fn sign<T: Serialize>(&self, msg: &T) -> Signature {
         self.kp.sign(&serde_json::to_string(&msg).expect("").as_bytes())
     }
 
@@ -58,10 +59,38 @@ impl Keypair {
         };
         let mut data = HashMap::default();
         data.insert(String::from("idx"), Vec::from(idx.to_be_bytes()));
-        data.insert(String::from("validator"), validator.to_bytes().to_vec());
+        data.insert(String::from("validator"), Vec::from(validator.to_bytes()));
+        data.insert(String::from("method"), b"stake".to_vec());
         let msg = Txn {
             to: VALIDATOR_ROOT,
             amount: VALIDATOR_STAKE,
+            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().nonce,
+            data
+        };
+        let sig = self.sign(&msg);
+        Signed::<Txn> {
+            msg,
+            from: self.kp.public.clone(),
+            sig
+        }
+    }
+
+    pub fn unstake(&self, state: &State) -> Signed<Txn> {
+        let mut rng = rand::thread_rng();
+        let idx = loop {
+            let rand = rng.gen::<u32>() % VALIDATOR_SLOTS;
+            if let Some(stake_data) = state.validators.get(&rand.to_be_bytes()) {
+                if stake_data.owner == self.kp.public {
+                    break rand;
+                }
+            }
+        };
+        let mut data = HashMap::default();
+        data.insert(String::from("idx"), Vec::from(idx.to_be_bytes()));
+        data.insert(String::from("method"), b"unstake".to_vec());
+        let msg = Txn {
+            to: VALIDATOR_ROOT,
+            amount: 0,
             nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().nonce,
             data
         };
