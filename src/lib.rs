@@ -1,8 +1,12 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 use std::time::Instant;
+use std::time::SystemTime;
 use blst::min_pk::*;
 use blst::BLST_ERROR;
 use digest::generic_array::sequence::Split;
+use ed25519_dalek::Verifier;
 use rand::prelude::*;
 use sha2::{Sha256, Digest};
 use names::Generator;
@@ -15,6 +19,14 @@ use core::array;
 use serde::{Serialize, Deserialize};
 use ethnum::U256;
 use std::fmt::Debug;
+use std::time::UNIX_EPOCH;
+
+use crate::{
+    txn::Txn,
+    account::Signed,
+    merkle::MerkleMap,
+    state::{State, BlockBuilder}
+};
 
 pub mod merkle;
 pub mod state;
@@ -22,159 +34,178 @@ pub mod account;
 pub mod validator;
 pub mod txn;
 
-/*
-
 const NUM_NODES: usize = 8;
 const NUM_ROUNDS: usize = 100;
 const LEADER_DELAY: usize = 20;
+const MAX_FORK: usize = 256;
 
-// ....................................................................
+const BLOCK_TIME: u64 = 10_000; // ms
+const MAX_PROP_TIME: u64 = 250; 
+const MAX_CLOCK_GAP: u64 = 3_000; 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct Header {
     round: u32,
     timestamp: u64,
     prev_hash: [u8; 32],
-    state_hash: [u8; 32],
-    txns_hash: [u8; 32],
-    seed: Either<Signature, [u8; 32]>,
-}
-
-impl Hashable for Header {
-    fn add_hash(&self, hasher: &mut Sha256) {
-        hasher.update(self.round.to_be_bytes());
-        hasher.update(self.timestamp.to_be_bytes());
-        hasher.update(&self.prev_hash);
-        hasher.update(&self.state_hash);
-        hasher.update(&self.txns_hash);
-        match &self.seed {
-            Either::Left(sig) => hasher.update(sig.to_bytes()),
-            Either::Right(hash) => hasher.update(hash)
-        }
-    }
+    state_commit: [u8; 32],
+    txnseq_commit: [u8; 32],
+    beacon: account::Signature,
+    seed: [u8; 32]
 }
 
 impl Header {
-    fn beacon(&self) -> [u8; 32] {
+    pub fn commit(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        match &self.seed {
-            Either::Left(sig) => hasher.update(sig.to_bytes()),
-            Either::Right(hash) => hasher.update(hash)
-        }
+        hasher.update(self.round.to_be_bytes());
+        hasher.update(self.timestamp.to_be_bytes());
+        hasher.update(self.prev_hash);
+        hasher.update(self.state_commit);
+        hasher.update(self.txnseq_commit);
+        hasher.update(self.beacon);
         hasher.finalize().into()
     }
 }
 
 #[derive(Debug, Clone)]
 struct Block {
-    sheader: Signed<Header>,
-    txns: TxnSeq
-}
-
-impl Hashable for Block {
-    fn add_hash(&self, hasher: &mut Sha256) {
-        &self.sheader.add_hash(hasher);
-        &self.txns.add_hash(hasher);
-    }
+    sheader: account::Signed<Header>,
+    txnseq: MerkleMap<Signed<Txn>>
 }
 
 #[derive(Debug, Clone)]
-struct Snapshot {
-    header: Header,
+struct Snap {
+    block: Block,
     state: State,
-    header_hash: [u8; 32],
-    beacon: [u8; 32],
-    next_leader: PublicKey
+    received_time: u64
 }
 
-impl Snapshot {
-    fn new(header: Header, state: State) -> Self {
-        let beacon = header.beacon();
-        Snapshot {
-            header_hash: header.hash(),
-            next_leader: (ValidatorIter { beacon, state: &state }).next().unwrap(),
-            header,
-            state,
-            beacon,
-        }
-    }
+#[derive(Debug)]
+struct Node<'a> {
+    kp: account::Keypair,
+    snaps: [HashMap<[u8; 32], Snap>; MAX_FORK],
+    head: ([u8; 32], &'a Snap),
+    txpool: HashSet<Signed<Txn>>,
+    leading: bool
 }
 
-#[derive(Debug, Clone)]
-struct Node {
-    keypair: KeyPair,
-    curr: Snapshot,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BlockError {
+    BadSig,
+    BadRound,
+    BigTimestamp,
+    SmallTimestamp,
+    BadBlockTime,
+    BadBeacon,
+    BadSeed,
+    BadTxnseq,
+    BadTxn,
+    BadState,
+    NoPrev
 }
 
-impl Node {
-    fn make_block(&self, txns: TxnSeq) -> Block {
-        let mut state_clone = self.curr.state.clone();
-        state_clone.apply_seq(&txns);
-        let header = Header {
-            round: self.curr.header.round + 1,
-            timestamp: 0u64,
-            prev_hash: self.curr.header_hash,
-            state_hash: state_clone.hash(),
-            txns_hash: txns.hash(),
-            seed: Either::Left(self.keypair.sk.sign(&self.curr.beacon, &[], &[])),
+impl<'a> Node<'a> {
+    // TODO: need to build async in the background and send at time cutoff
+    // TODO: selection for 2nd, 3rd, ... leaders (not impl here doe)
+    fn make_block(&self, propsal_no: u64) -> Block {
+        let round = self.head.1.block.sheader.msg.round + 1;
+        let timestamp = self.head.1.block.sheader.msg.timestamp + propsal_no * BLOCK_TIME;
+        let beacon = self.kp.sign(&self.head.1.block.sheader.msg.seed);
+        let seed = Sha256::digest(beacon).into();
+        let external = state::ExternalData { round, timestamp, seed };
+        let mut builder = BlockBuilder {
+            txnseq: MerkleMap::default(),
+            count: 0,
+            state: self.head.1.state.clone(),
+            external
         };
-        Block {
-            sheader: Signed::new(header, &self.keypair.sk),
-            txns
-        }
-    }
-
-    fn random_txn(&self) -> Signed<Txn> {
-        let mut rng = rand::thread_rng();
-        let to = self.curr.state.select_validator(rng.gen::<usize>() as f64 / usize::MAX as f64).unwrap();
-        let my_acc = self.curr.state.accounts.get(&Sha256::digest(self.keypair.pk.to_bytes()).into()).unwrap();
-        let nonce = my_acc.nonce + 1;
-        let amount = my_acc.bal / 2;
-        let txn = Txn { to, nonce, amount };
-        let sig = self.keypair.sk.sign(&txn.hash(), &[], &[]);
-        Signed::<Txn> { msg: txn, pk: self.keypair.pk, sig }
-    }
-
-    // TODO: throw error with reason
-    fn validate_block(&self, block: &Block) -> Option<State> {
-        // bad sig
-        if !block.sheader.verify() { return None; }
-        // not building on my curr
-        if &block.sheader.msg.prev_hash != &self.curr.header_hash { return None; }
-        // wrong round
-        if block.sheader.msg.round != &self.curr.header.round + 1 { return None; }
-        // wrong state transition
-        let mut state_clone = self.curr.state.clone();
-        state_clone.apply_seq(&block.txns);
-        if state_clone.hash() != block.sheader.msg.state_hash { return None; }
-        match &block.sheader.msg.seed {
-            Either::Left(sig) => {
-                // bad seed
-                if BLST_ERROR::BLST_SUCCESS != sig.verify(true, &self.curr.beacon, &[], &[], &self.curr.next_leader, true) {
-                    return None;
-                }
-            },
-            Either::Right(hash) => {
-                // txns without leader
-                if block.txns.seq.len() > 0 { return None; }
-                // bad seed
-                let seed: [u8; 32] = Sha256::digest(&self.curr.beacon).into();
-                if &seed != hash { return None; }
+        for txn in self.txpool { // does this drain?
+            if let Err((txn, err)) = builder.add(txn) {
+                // TODO: decide when to remove from txpool
             }
         }
-        Some(state_clone)
+        let header = Header {
+            round,
+            timestamp,
+            prev_hash: self.head.0,
+            state_commit: builder.state.commit(),
+            beacon,
+            txnseq_commit: builder.txnseq.commit(),
+            seed
+        };
+        let sig = self.kp.sign(&header);
+        Block {
+            sheader: Signed::<Header> {
+                msg: header,
+                from: self.kp.kp.public,
+                sig
+            },
+            txnseq: builder.txnseq
+        }
+    }
+
+    fn validate_block(&self, block: &Block) -> Result<(State, u64), BlockError> {
+        let header = block.sheader.msg;
+        if !block.sheader.verify() { return Err(BlockError::BadSig); }
+        let timestamp = state::timestamp();
+        if timestamp > header.timestamp + MAX_CLOCK_GAP + MAX_PROP_TIME {
+            return Err(BlockError::SmallTimestamp);
+        }
+        if timestamp + MAX_CLOCK_GAP < header.timestamp {
+            return Err(BlockError::BigTimestamp);
+        }
+        let prev = self
+            .snaps[(header.round - 1) as usize % MAX_FORK]
+            .get(&header.prev_hash)
+            .ok_or(BlockError::NoPrev)?;
+        if header.round != prev.block.sheader.msg.round + 1 {
+            return Err(BlockError::BadRound);
+        }
+        if header.timestamp != prev.block.sheader.msg.timestamp + BLOCK_TIME  {
+            return Err(BlockError::BadBlockTime);
+        }
+        if block.sheader.from.verify(
+            &header.round.to_be_bytes(), 
+            &header.beacon
+        ).is_err() {
+            return Err(BlockError::BadBeacon);
+        }
+        let seed: [u8; 32] = Sha256::digest(&header.beacon).into();
+        if header.seed != seed {
+            return Err(BlockError::BadSeed)
+        }
+        if header.txnseq_commit != block.txnseq.commit() {
+            return Err(BlockError::BadTxnseq);
+        }
+        // TODO: check is leader
+        let external = state::ExternalData { 
+            round: header.round, 
+            timestamp: header.timestamp, 
+            seed: header.seed
+        };
+        let mut builder = BlockBuilder {
+            txnseq: MerkleMap::default(),
+            count: 0, // ugly
+            state: self.head.1.state.clone(),
+            external
+        };
+        for txn in block.txnseq.iter() {
+            if builder.add(txn.clone()).is_err() {
+                return Err(BlockError::BadTxn);
+            }
+        }
+        if header.state_commit != builder.state.commit() {
+            return Err(BlockError::BadState);
+        }
+        Ok((builder.state, timestamp))
+    }
+
+    fn is_leader(&mut self, proposal_no: usize) -> bool {
+        self.head.1.state.leader(&self.head.1.block.sheader.msg.seed, proposal_no) == &self.kp.kp.public
     }
 
     fn send(&self) -> Option<Block> {
-        let mut vseq = ValidatorIter { beacon: self.curr.beacon, state: &self.curr.state };
-        let leader = vseq.next().unwrap();
-        if self.keypair.pk == leader {
-            let txnseq = TxnSeq { seq: Vec::from([self.random_txn()]) };
-            let block = self.make_block(txnseq.clone());
-            Some(block)
-        } else {
-            None
-        }
+        let 
     }
 
     fn receive(&mut self, block: Block) {
@@ -182,21 +213,6 @@ impl Node {
             self.curr = Snapshot::new(block.sheader.msg, state);
         }
     }
-}
-
-// ....................................................................
-
-#[derive(Debug, Clone)]
-struct KeyPair {
-    sk: SecretKey,
-    pk: PublicKey,
-}
-
-fn gen() -> KeyPair {
-    let mut rng = rand::thread_rng();
-    let seed: [u8; 32] = core::array::from_fn(|_| rng.gen());
-    let sk = SecretKey::key_gen(&seed, &[]).unwrap();
-    KeyPair { sk: sk.clone(), pk: sk.sk_to_pk() }
 }
 
 fn main() {
@@ -266,5 +282,3 @@ fn main() {
     println!("Elapsed time: {} ms", now.elapsed().as_millis());
 
 }
-
-*/

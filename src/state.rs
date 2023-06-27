@@ -1,5 +1,6 @@
-use sha2::{Sha256, Digest};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Sha256, Digest};
 use crate::merkle::MerkleMap;
 use crate::account::{self, Signed};
 use crate::validator;
@@ -8,6 +9,7 @@ use crate::txn::Txn;
 pub const VALIDATOR_ROOT: account::Account = [0u8; 32];
 pub const VALIDATOR_SLOTS: u32 = 256;
 pub const VALIDATOR_STAKE: u32 = 1024;
+pub const NUM_SHARDS: u8 = 1;
 
 pub const JENNY_ACC_PK_BYTES: [u8; 32] = [
     78, 236, 79, 93, 128, 157, 88, 31, 
@@ -21,26 +23,6 @@ pub const JENNY_ACC_SK_BYTES: [u8; 32] = [
     247, 20, 168, 62, 111, 208, 138, 117, 
     205, 14, 172, 198, 231, 24, 204, 42
 ];
-pub const JENNY_VALID_PK_BYTES: [u8; 96] = [
-    133, 12, 37, 99, 41, 10, 199, 203, 
-    22, 230, 70, 244, 192, 87, 233, 78, 
-    140, 82, 222, 2, 209, 217, 83, 23, 
-    241, 142, 75, 84, 27, 120, 155, 41, 
-    39, 209, 130, 40, 10, 242, 125, 211, 
-    15, 200, 167, 209, 7, 245, 212, 32, 
-    21, 243, 23, 93, 61, 3, 170, 201, 
-    45, 25, 28, 37, 167, 235, 118, 203, 
-    206, 161, 50, 254, 69, 141, 226, 96, 
-    43, 87, 199, 240, 86, 91, 27, 143, 
-    152, 122, 208, 186, 140, 74, 177, 190, 
-    135, 40, 61, 83, 46, 74, 87, 56
-];
-pub const JENNY_VALID_SK_BYTES: [u8; 32] =[
-    30, 37, 233, 107, 196, 128, 92, 235, 
-    104, 132, 120, 23, 5, 215, 213, 158, 
-    95, 233, 10, 73, 143, 23, 31, 31, 
-    141, 36, 195, 143, 96, 194, 43, 51
-];
 
 const _MAX_FORK: u32 = 128;
 
@@ -48,26 +30,34 @@ const _MAX_FORK: u32 = 128;
 pub struct BlockBuilder {
     pub txnseq: MerkleMap<Signed<Txn>>,
     pub count: u32,
-    pub state: State
+    pub state: State,
+    pub external: ExternalData
 }
 
 impl BlockBuilder {
-    pub fn new(state: State) -> Self {
+    pub fn new(state: State, external: ExternalData) -> Self {
         Self {
             txnseq: MerkleMap::default(),
             count: 0,
-            state
+            state,
+            external
         }
     }
 
-    pub fn add(&mut self, stxn: Signed<Txn>) -> Result<(), TxnError> {
-        self.state.apply(&stxn)?;
-        self.txnseq.insert(
-            &self.count.to_be_bytes(),
-            stxn
-        );
-        self.count += 1;
-        Ok(())
+    pub fn add(&mut self, stxn: Signed<Txn>) -> Result<(), (Signed<Txn>, TxnError)> {
+        match self.state.apply(&stxn, &self.external) {
+            Ok(()) => {
+                self.txnseq.insert(
+                    &self.count.to_be_bytes(),
+                    stxn
+                );
+                self.count += 1;
+                Ok(())
+            },
+            Err(txnerr) => {
+                Err((stxn, txnerr))
+            }
+        }
     }
 }
 
@@ -75,8 +65,19 @@ impl BlockBuilder {
 pub struct State {
     pub accounts: MerkleMap<account::Data>,
     pub validators: MerkleMap<validator::Data>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalData {
     pub round: u32,
+    pub timestamp: u64,
     pub seed: [u8; 32]
+}
+
+impl Default for ExternalData {
+    fn default() -> Self {
+        ExternalData { round: 0, timestamp: timestamp(), seed: [0u8; 32] }
+    }
 }
 
 impl Default for State {
@@ -84,8 +85,6 @@ impl Default for State {
         let mut def = Self {
             accounts: MerkleMap::default(),
             validators: MerkleMap::default(),
-            round: 0,
-            seed: [0u8; 32]
         };
         let jenny_acc = account::Keypair { kp: ed25519_dalek::Keypair {
             public: account::PublicKey::from_bytes(&JENNY_ACC_PK_BYTES).unwrap(),
@@ -98,13 +97,9 @@ impl Default for State {
                 nonce: 0 
             }
         );
-        let mut bb = BlockBuilder::new(def);
-        let jenny_val = validator::Keypair {
-            pk: validator::PublicKey::from_bytes(&JENNY_VALID_PK_BYTES).unwrap(),
-            sk: validator::SecretKey::from_bytes(&JENNY_VALID_SK_BYTES).unwrap(),
-        };
+        let mut bb = BlockBuilder::new(def, ExternalData::default());
         for _ in 0..VALIDATOR_SLOTS >> 1 {
-            assert_eq!(bb.add(jenny_acc.stake(jenny_val.pk, &bb.state)), Ok(()));
+            assert_eq!(bb.add(jenny_acc.stake(&bb.state)), Ok(()));
         }
         println!("{:?}", bb.state);
         bb.state
@@ -115,7 +110,6 @@ impl Default for State {
 pub enum TxnError {
     BadFromPk,
     BadSig,
-    BadValidPk,
     BadStakeIdx,
     BadMethod,
     InsuffBal,
@@ -130,7 +124,7 @@ pub enum Update {
 }
 
 impl State {
-    fn verify(&self, stxn: &Signed<Txn>) -> Result<Vec<Update>, TxnError> {
+    fn verify(&self, stxn: &Signed<Txn>, external: &ExternalData) -> Result<Vec<Update>, TxnError> {
         let from_addy: [u8; 32] = Sha256::digest(&stxn.from.to_bytes()).into();
         let mut from_account = self.accounts.get(&from_addy)
             .ok_or(TxnError::BadFromPk)?
@@ -169,19 +163,12 @@ impl State {
                 if stxn.msg.amount != VALIDATOR_STAKE {
                     return Err(TxnError::InsuffStake);
                 }
-                let validator_pk = match stxn.msg.data.get("validator") {
-                    None => Err(TxnError::BadValidPk),
-                    Some(val_pk_bytes) => 
-                        blst::min_sig::PublicKey::from_bytes(val_pk_bytes)
-                            .map_err(|_| TxnError::BadValidPk)
-                }?;
                 if self.validators.get(&idx).is_some() {
                     return Err(TxnError::BadStakeIdx);
                 }
                 let val_data = validator::Data { 
-                    round: self.round, 
-                    owner: stxn.from.clone(), 
-                    validator: validator_pk.to_bytes()
+                    round: external.round, 
+                    owner: stxn.from.clone()
                 };
                 Ok(Vec::from([
                     Update::AccountUp(from_addy, Some(from_account)),
@@ -229,8 +216,8 @@ impl State {
         }
     }
 
-    pub fn apply<'a> (&mut self, stxn: &'a Signed<Txn>) -> Result<(), TxnError> {
-        for up in self.verify(stxn)? {
+    pub fn apply<'a> (&mut self, stxn: &'a Signed<Txn>, external: &ExternalData) -> Result<(), TxnError> {
+        for up in self.verify(stxn, external)? {
             match up {
                 Update::AccountUp(addy, opt_acc) => {
                     match opt_acc {
@@ -249,9 +236,23 @@ impl State {
         Ok(())
     }
 
-    pub fn validators<'a> (&'a self) -> impl Iterator<Item = blst::min_sig::PublicKey> + 'a { // impl Iterator<Item = PublicKey> + 'a {
-        validator::ValidatorIter { seed: self.seed, validators: &self.validators }
+    pub fn commit(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.accounts.commit());
+        hasher.update(self.validators.commit());
+        hasher.finalize().into()
     }
+
+    pub fn leader<'a> (&'a self, seed: &[u8; 32], proposal_no: usize) -> &'a account::PublicKey {
+        validator::leader(seed, &self.validators, proposal_no)
+    }
+}
+
+pub fn timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -260,22 +261,21 @@ pub mod tests {
 
     use super::*;
 
-    pub fn setup() -> (account::Keypair, validator::Keypair, BlockBuilder) {
+    pub fn setup() -> (account::Keypair, BlockBuilder) {
         let jenny_acc = account::Keypair { kp: ed25519_dalek::Keypair {
             public: account::PublicKey::from_bytes(&JENNY_ACC_PK_BYTES).unwrap(),
             secret: account::SecretKey::from_bytes(&JENNY_ACC_SK_BYTES).unwrap()
         }};
-        let jenny_val = validator::Keypair {
-            pk: validator::PublicKey::from_bytes(&JENNY_VALID_PK_BYTES).unwrap(),
-            sk: validator::SecretKey::from_bytes(&JENNY_VALID_SK_BYTES).unwrap(),
-        };
-        let builder = BlockBuilder::new(State::default());
-        (jenny_acc, jenny_val, builder)
+        let builder = BlockBuilder::new(
+            State::default(),
+            ExternalData::default()
+        );
+        (jenny_acc, builder)
     }
 
     #[test]
     fn payments() {
-        let (alice, _, mut builder) = setup();
+        let (alice, mut builder) = setup();
         let old = builder.state.clone();
         let bob = account::Keypair::gen();
         let charlie = account::Keypair::gen();
@@ -319,20 +319,19 @@ pub mod tests {
     }
 
     #[test]
-    fn validators() {
-        let (alice, alice_val, mut builder) = setup();
+    fn leader() {
+        let (alice, mut builder) = setup();
         let bob = account::Keypair::gen();
         println!("{:?}", builder.add(
             alice.send(bob.kp.public, 1 << 15,  &builder.state)
         ));
         for _ in 0..64 {
             println!("{:?}", builder.add(
-                alice.stake(alice_val.pk, &builder.state)
+                alice.stake(&builder.state)
             ));
         }
-        let bob_val = validator::Keypair::gen();
         for _ in 64..80 {
-            assert!(builder.add(bob.stake(bob_val.pk, &builder.state)).is_ok());
+            assert!(builder.add(bob.stake(&builder.state)).is_ok());
         }
         println!("{:?}", builder.state);
         println!("{:?}", builder.state.validators.iter().collect::<Vec<&validator::Data>>());
@@ -343,20 +342,26 @@ pub mod tests {
                 alice.unstake(&builder.state)
             ));
         }
-        let mut val_iter = builder.state.validators();
         let mut alice_count = 0;
-        for _ in 0..1000 {
-            if val_iter.next().unwrap() == alice_val.pk {
+        for i in 0u32..1000u32 {
+            if builder.state.leader(&Sha256::digest(i.to_be_bytes()).into(), 1) == &alice.kp.public {
                 alice_count += 1;
             }
         }
         // alice count variance 160 => stdev < 13 => 800 +- 65 should be guaranteed
         assert!((800-65..=800+65).contains(&alice_count));
+        alice_count = 0;
+        for i in 0..1000 {
+            if builder.state.leader(&Sha256::digest(1u32.to_be_bytes()).into(), i) == &alice.kp.public {
+                alice_count += 1;
+            }
+        }
+        assert!((800-65..=800+65).contains(&alice_count));
     }
 
     #[test]
     fn badfrompk() {
-        let (alice, _, mut builder) = setup();
+        let (alice, mut builder) = setup();
         let bob = account::Keypair::gen();
         // BadFromPk
         let msg = Txn {
@@ -370,14 +375,14 @@ pub mod tests {
                 msg: msg.clone(),
                 sig: bob.sign(&msg),
                 from: bob.kp.public
-            }), 
+            }).map_err(|e| e.1), 
             Err(TxnError::BadFromPk)
         );
     }
 
     #[test]
     fn badsig() {
-        let (alice, _, mut builder) = setup();
+        let (alice, mut builder) = setup();
         let bob = account::Keypair::gen();
         // BadSig
         let msg = Txn {
@@ -391,7 +396,7 @@ pub mod tests {
                 msg: msg.clone(),
                 sig: bob.sign(&msg),
                 from: alice.kp.public
-            }), 
+            }).map_err(|e| e.1), 
             Err(TxnError::BadSig)
         );
         let msg = Txn {
@@ -411,79 +416,20 @@ pub mod tests {
                 msg: msg.clone(),
                 sig: alice.sign(&other_msg),
                 from: alice.kp.public
-            }), 
+            }).map_err(|e| e.1), 
             Err(TxnError::BadSig)
         );
     }
 
     #[test]
-    fn badvalidpk() {
-        let (alice, alice_val, mut builder) = setup();
-        let mut data = HashMap::default();
-        data.insert(
-            String::from("idx"), 
-            alice.stake(alice_val.pk.clone(), &builder.state).msg.data.get("idx").unwrap().clone()
-        );
-        data.insert(
-            String::from("method"), 
-            b"stake".to_vec()
-        );
-        let msg = Txn {
-            to: VALIDATOR_ROOT,
-            amount: VALIDATOR_STAKE,
-            nonce: VALIDATOR_SLOTS >> 1,
-            data
-        };
-        assert_eq!(
-            builder.add(Signed::<Txn> {
-                msg: msg.clone(),
-                sig: alice.sign(&msg),
-                from: alice.kp.public
-            }), 
-            Err(TxnError::BadValidPk)
-        );
-        let mut data = HashMap::default();
-        data.insert(
-            String::from("idx"), 
-            alice.stake(alice_val.pk.clone(), &builder.state).msg.data.get("idx").unwrap().clone()
-        );
-        data.insert(
-            String::from("validator"), 
-            b"silly string".to_vec()
-        );
-        data.insert(
-            String::from("method"), 
-            b"stake".to_vec()
-        );
-        let msg = Txn {
-            to: VALIDATOR_ROOT,
-            amount: VALIDATOR_STAKE,
-            nonce: VALIDATOR_SLOTS >> 1,
-            data
-        };
-        assert_eq!(
-            builder.add(Signed::<Txn> {
-                msg: msg.clone(),
-                sig: alice.sign(&msg),
-                from: alice.kp.public
-            }), 
-            Err(TxnError::BadValidPk)
-        );
-    }
-
-    #[test]
     fn badstakeidx() {
-        let (alice, alice_val, mut builder) = setup();
+        let (alice, mut builder) = setup();
         let mut data = HashMap::default();
         data.insert(
             String::from("idx"), 
             alice.unstake(&builder.state).msg.data.get("idx").unwrap().clone()
         );
         data.insert(
-            String::from("validator"), 
-            Vec::from(alice_val.pk.to_bytes())
-        );
-        data.insert(
             String::from("method"), 
             b"stake".to_vec()
         );
@@ -498,17 +444,13 @@ pub mod tests {
                 msg: msg.clone(),
                 sig: alice.sign(&msg),
                 from: alice.kp.public
-            }), 
+            }).map_err(|e| e.1), 
             Err(TxnError::BadStakeIdx)
         );
         let mut data = HashMap::default();
         data.insert(
             String::from("idx"), 
-            alice.stake(alice_val.pk.clone(), &builder.state).msg.data.get("idx").unwrap().clone()
-        );
-        data.insert(
-            String::from("validator"), 
-            Vec::from(alice_val.pk.to_bytes())
+            alice.stake(&builder.state).msg.data.get("idx").unwrap().clone()
         );
         data.insert(
             String::from("method"), 
@@ -525,22 +467,18 @@ pub mod tests {
                 msg: msg.clone(),
                 sig: alice.sign(&msg),
                 from: alice.kp.public
-            }), 
+            }).map_err(|e| e.1), 
             Err(TxnError::BadStakeIdx)
         );
     }
 
     #[test]
     fn badmethod() {
-        let (alice, alice_val, mut builder) = setup();
+        let (alice, mut builder) = setup();
         let mut data = HashMap::default();
         data.insert(
             String::from("idx"), 
-            alice.stake(alice_val.pk.clone(), &builder.state).msg.data.get("idx").unwrap().clone()
-        );
-        data.insert(
-            String::from("validator"), 
-            Vec::from(alice_val.pk.to_bytes())
+            alice.stake(&builder.state).msg.data.get("idx").unwrap().clone()
         );
         let msg = Txn {
             to: VALIDATOR_ROOT,
@@ -553,18 +491,14 @@ pub mod tests {
                 msg: msg.clone(),
                 sig: alice.sign(&msg),
                 from: alice.kp.public
-            }), 
+            }).map_err(|e| e.1), 
             Err(TxnError::BadMethod)
         );
-        let (alice, alice_val, mut builder) = setup();
+        let (alice, mut builder) = setup();
         let mut data = HashMap::default();
         data.insert(
             String::from("idx"), 
-            alice.stake(alice_val.pk.clone(), &builder.state).msg.data.get("idx").unwrap().clone()
-        );
-        data.insert(
-            String::from("validator"), 
-            Vec::from(alice_val.pk.to_bytes())
+            alice.stake(&builder.state).msg.data.get("idx").unwrap().clone()
         );
         data.insert(
             String::from("method"), 
@@ -581,32 +515,28 @@ pub mod tests {
                 msg: msg.clone(),
                 sig: alice.sign(&msg),
                 from: alice.kp.public
-            }), 
+            }).map_err(|e| e.1), 
             Err(TxnError::BadMethod)
         );
     }
 
     #[test]
     fn insuffbal() {
-        let (alice, _, mut builder) = setup();
+        let (alice, mut builder) = setup();
         let bob = account::Keypair::gen();
         assert_eq!(
-            builder.add(alice.send(bob.kp.public, 1 << 20, &builder.state)), 
+            builder.add(alice.send(bob.kp.public, 1 << 20, &builder.state)).map_err(|e| e.1), 
             Err(TxnError::InsuffBal)
         );
     }
 
     #[test]
     fn insuffstake() {
-        let (alice, alice_val, mut builder) = setup();
+        let (alice, mut builder) = setup();
         let mut data = HashMap::default();
         data.insert(
             String::from("idx"), 
-            alice.stake(alice_val.pk.clone(), &builder.state).msg.data.get("idx").unwrap().clone()
-        );
-        data.insert(
-            String::from("validator"), 
-            Vec::from(alice_val.pk.to_bytes())
+            alice.stake( &builder.state).msg.data.get("idx").unwrap().clone()
         );
         data.insert(
             String::from("method"), 
@@ -623,14 +553,14 @@ pub mod tests {
                 msg: msg.clone(),
                 sig: alice.sign(&msg),
                 from: alice.kp.public
-            }), 
+            }).map_err(|e| e.1), 
             Err(TxnError::InsuffStake)
         );
     }
 
     #[test]
     fn smallnonce() {
-        let (alice, _, mut builder) = setup();
+        let (alice, mut builder) = setup();
         let bob = account::Keypair::gen();
         let old = builder.clone();
         assert_eq!(
@@ -638,14 +568,14 @@ pub mod tests {
             Ok(())
         );
         assert_eq!(
-            builder.add(alice.send(bob.kp.public, 1, &old.state)), 
+            builder.add(alice.send(bob.kp.public, 1, &old.state)).map_err(|e| e.1), 
             Err(TxnError::SmallNonce)
         );
     }
 
     #[test]
     fn bignonce() {
-        let (alice, _, mut builder) = setup();
+        let (alice, mut builder) = setup();
         let bob = account::Keypair::gen();
         let mut old = builder.clone();
         assert_eq!(
@@ -653,7 +583,7 @@ pub mod tests {
             Ok(())
         );
         assert_eq!(
-            old.add(alice.send(bob.kp.public, 1, &builder.state)), 
+            old.add(alice.send(bob.kp.public, 1, &builder.state)).map_err(|e| e.1), 
             Err(TxnError::BigNonce)
         );
     }

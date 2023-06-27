@@ -1,6 +1,11 @@
 use blst::BLST_ERROR;
-use ed25519_dalek::{Verifier, Signer};
-use tammany::{merkle::MerkleMap, state::{self, Keypair, State, Signed, Txn, AccountData}};
+use ed25519_dalek::{Signer, Verifier};
+use tammany::{
+    merkle::MerkleMap, 
+    state::State, 
+    account,
+    validator
+};
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use sha2::{Sha256, Digest};
@@ -32,7 +37,7 @@ fn merkle_map(crit: &mut Criterion) {
         }
     }));
 
-    let alice = Keypair::gen();
+    let alice = account::Keypair::gen();
     let mut state = State {
         accounts: MerkleMap::default(),
         validators: MerkleMap::default(),
@@ -41,9 +46,9 @@ fn merkle_map(crit: &mut Criterion) {
     };
     state.accounts.insert(
         &Sha256::digest(alice.kp.public.to_bytes()),
-        AccountData { bal: 1 << 17, nonce: 0 }
+        account::Data { bal: 1 << 17, nonce: 0 }
     );
-    let bob = Keypair::gen();
+    let bob = account::Keypair::gen();
     crit.bench_function("state payment", |b| b.iter(|| {
         let mut state = state.clone();
         assert!(state.apply(&alice.send(bob.kp.public, 1, &state)).is_ok());
@@ -51,7 +56,7 @@ fn merkle_map(crit: &mut Criterion) {
 }
 
 fn sigs(crit: &mut Criterion) {
-    let alice = Keypair::gen();
+    let alice = account::Keypair::gen();
     let sig = alice.kp.sign(b"message");
     crit.bench_function("eddsa sign", |b| b.iter(|| {
         let _ = alice.kp.sign(b"message");
@@ -59,7 +64,7 @@ fn sigs(crit: &mut Criterion) {
     crit.bench_function("eddsa verify", |b| b.iter(|| {
         assert!(alice.kp.public.verify(b"message", &sig).is_ok());
     }));
-    let alice = tammany::state::Validator::Keypair::gen();
+    let alice = tammany::validator::Keypair::gen();
     let sig = alice.sk.sign(b"message", &[], &[]);
     crit.bench_function("bls sign", |b| b.iter(|| {
         let _ = alice.sk.sign(b"message", &[], &[]);

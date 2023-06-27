@@ -163,7 +163,7 @@ impl<T: Serialize + Clone> MerkleNode<T> {
                     let nibble = k[cut_at] as usize;
                     if let Some(ref child) = children[nibble] {
                         let mut clone = self.clone();
-                        let (mut child_clone, ret) = child.remove(suffix);
+                        let (child_clone, ret) = child.remove(suffix);
                         if let (None, None) = (&child_clone.node.children, &child_clone.node.value) {
                             // child is empty, remove it
                             clone.node.children.as_mut().unwrap()[nibble] = None;
@@ -349,6 +349,10 @@ impl<V: Serialize + Clone> MerkleMap<V> {
         self.root.search(filter)
     }
 
+    pub fn commit(&self) -> [u8; 32] {
+        self.root.commit
+    }
+
 }
 
 #[cfg(test)]
@@ -530,7 +534,7 @@ mod tests {
 
     #[test]
     fn search_node() {
-        let mut node: MerkleNode<u8> = MerkleNode::default()
+        let node: MerkleNode<u8> = MerkleNode::default()
             .insert(&[0, 1, 0], 0).0
             .insert(&[0, 1, 2, 3, 4], 1).0
             .insert(&[1], 2).0

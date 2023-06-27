@@ -49,7 +49,7 @@ impl Keypair {
         }
     }
 
-    pub fn stake(&self, validator: blst::min_sig::PublicKey, state: &State) -> Signed<Txn> {
+    pub fn stake(&self, state: &State) -> Signed<Txn> {
         let mut rng = rand::thread_rng();
         let idx = loop {
             let rand = rng.gen::<u32>() % VALIDATOR_SLOTS;
@@ -59,7 +59,6 @@ impl Keypair {
         };
         let mut data = HashMap::default();
         data.insert(String::from("idx"), Vec::from(idx.to_be_bytes()));
-        data.insert(String::from("validator"), Vec::from(validator.to_bytes()));
         data.insert(String::from("method"), b"stake".to_vec());
         let msg = Txn {
             to: VALIDATOR_ROOT,
