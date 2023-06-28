@@ -11,6 +11,9 @@ pub const VALIDATOR_SLOTS: u32 = 256;
 pub const VALIDATOR_STAKE: u32 = 1024;
 pub const NUM_SHARDS: u8 = 1;
 
+pub const TXN_BATCH_SIZE: usize = 128;
+pub const MAX_BLOCK_SIZE: usize = 1024;
+
 pub const JENNY_ACC_PK_BYTES: [u8; 32] = [
     78, 236, 79, 93, 128, 157, 88, 31, 
     180, 214, 106, 188, 148, 28, 247, 180, 
@@ -29,6 +32,7 @@ const _MAX_FORK: u32 = 128;
 #[derive(Debug, Clone)]
 pub struct BlockBuilder {
     pub txnseq: MerkleMap<Signed<Txn>>,
+    pub batch: Vec<Signed<Txn>>,
     pub count: u32,
     pub state: State,
     pub external: ExternalData
@@ -38,25 +42,49 @@ impl BlockBuilder {
     pub fn new(state: State, external: ExternalData) -> Self {
         Self {
             txnseq: MerkleMap::default(),
+            batch: Vec::default(),
             count: 0,
             state,
             external
         }
     }
 
-    pub fn add(&mut self, stxn: Signed<Txn>) -> Result<(), (Signed<Txn>, TxnError)> {
+    pub fn flush(&mut self) -> String {
+        let str = serde_json::to_string(&self.batch).unwrap();
+        for txn in self.batch {
+            self.txnseq.insert(
+                &self.count.to_be_bytes(),
+                txn
+            );
+            self.count += 1;
+        }
+        str
+    }
+
+    pub fn add(&mut self, stxn: Signed<Txn>) -> Result<Option<String>, (Signed<Txn>, TxnError)> {
+        if self.count as usize + self.batch.len() == MAX_BLOCK_SIZE {
+            return Err((stxn, TxnError::FullBlock));
+        }
         match self.state.apply(&stxn, &self.external) {
             Ok(()) => {
-                self.txnseq.insert(
-                    &self.count.to_be_bytes(),
-                    stxn
-                );
-                self.count += 1;
-                Ok(())
+                self.batch.push(stxn);
+                if self.batch.len() == TXN_BATCH_SIZE {
+                    Ok(Some(self.flush()))
+                } else {
+                    Ok(None)
+                }
             },
             Err(txnerr) => {
                 Err((stxn, txnerr))
             }
+        }
+    }
+
+    pub fn finalize(&mut self) -> Option<String> {
+        if self.batch.is_empty() {
+            None
+        } else {
+            Some(self.flush())
         }
     }
 }
@@ -67,7 +95,7 @@ pub struct State {
     pub validators: MerkleMap<validator::Data>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalData {
     pub round: u32,
     pub timestamp: u64,
@@ -99,7 +127,7 @@ impl Default for State {
         );
         let mut bb = BlockBuilder::new(def, ExternalData::default());
         for _ in 0..VALIDATOR_SLOTS >> 1 {
-            assert_eq!(bb.add(jenny_acc.stake(&bb.state)), Ok(()));
+            assert!(bb.add(jenny_acc.stake(&bb.state)).is_ok());
         }
         println!("{:?}", bb.state);
         bb.state
@@ -116,6 +144,7 @@ pub enum TxnError {
     InsuffStake,
     SmallNonce,
     BigNonce,
+    FullBlock,
 }
 
 pub enum Update {
@@ -563,9 +592,8 @@ pub mod tests {
         let (alice, mut builder) = setup();
         let bob = account::Keypair::gen();
         let old = builder.clone();
-        assert_eq!(
-            builder.add(alice.send(bob.kp.public, 1, &builder.state)), 
-            Ok(())
+        assert!(
+            builder.add(alice.send(bob.kp.public, 1, &builder.state)).is_ok()
         );
         assert_eq!(
             builder.add(alice.send(bob.kp.public, 1, &old.state)).map_err(|e| e.1), 
@@ -578,9 +606,8 @@ pub mod tests {
         let (alice, mut builder) = setup();
         let bob = account::Keypair::gen();
         let mut old = builder.clone();
-        assert_eq!(
-            builder.add(alice.send(bob.kp.public, 1, &builder.state)), 
-            Ok(())
+        assert!(
+            builder.add(alice.send(bob.kp.public, 1, &builder.state)).is_ok()
         );
         assert_eq!(
             old.add(alice.send(bob.kp.public, 1, &builder.state)).map_err(|e| e.1), 

@@ -37,7 +37,7 @@ pub mod txn;
 const NUM_NODES: usize = 8;
 const NUM_ROUNDS: usize = 100;
 const LEADER_DELAY: usize = 20;
-const MAX_FORK: usize = 256;
+const MAX_FORK: u32 = 256;
 
 const BLOCK_TIME: u64 = 10_000; // ms
 const MAX_PROP_TIME: u64 = 250; 
@@ -46,6 +46,7 @@ const MAX_CLOCK_GAP: u64 = 3_000;
 #[derive(Debug, Clone, Serialize)]
 struct Header {
     round: u32,
+    proposal: u32,
     timestamp: u64,
     prev_hash: [u8; 32],
     state_commit: [u8; 32],
@@ -58,6 +59,7 @@ impl Header {
     pub fn commit(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.round.to_be_bytes());
+        hasher.update(self.proposal.to_be_bytes());
         hasher.update(self.timestamp.to_be_bytes());
         hasher.update(self.prev_hash);
         hasher.update(self.state_commit);
@@ -80,13 +82,66 @@ struct Snap {
     received_time: u64
 }
 
+#[derive(Debug, Clone)]
+struct BlockStreamer {
+    pub txnseq: MerkleMap<Signed<Txn>>,
+    pub count: u32,
+    pub state: State,
+    pub external: state::ExternalData,
+    next_batch: u32,
+    unprocessed_batches: HashMap<u32, Vec<Signed<Txn>>>,
+    num_batches: u32
+}
+
+impl BlockStreamer {
+    fn new(state: State, external: state::ExternalData) -> Self {
+        Self {
+            txnseq: MerkleMap::default(),
+            count: 0,
+            state,
+            external,
+            next_batch: 0,
+            unprocessed_batches: HashMap::default(),
+            num_batches: u32::MAX
+        }
+    }
+
+    fn add(&mut self, batch: Vec<Signed<Txn>>, batch_no: u32) -> Result<bool, BlockError> {
+        if batch_no >= self.next_batch {
+            self.unprocessed_batches.insert(batch_no, batch);
+        }
+        if batch_no > self.num_batches {
+            return Err(BlockError::BigBatch);
+        }
+        while let Some(batch) = self.unprocessed_batches.remove(&self.next_batch) {
+            for txn in batch {
+                if self.count as usize == state::MAX_BLOCK_SIZE {
+                    return Err(BlockError::BadTxn);
+                }
+                self.state.apply(&txn, &self.external)
+                    .map_err(|_| BlockError::BadTxn)?;
+            }
+            self.next_batch += 1;
+        }
+        if batch_no > num_batches {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+// compute and build on only one chain
+// have code to resync on a fork: if longer chain pops up process seq of blocks
+// to start resync just need to see longer valid header chain
+
 #[derive(Debug)]
-struct Node<'a> {
+struct Node {
     kp: account::Keypair,
-    snaps: [HashMap<[u8; 32], Snap>; MAX_FORK],
-    head: ([u8; 32], &'a Snap),
-    txpool: HashSet<Signed<Txn>>,
-    leading: bool
+    snaps: [HashMap<[u8; 32], Snap>; MAX_FORK as usize], // self hash indexed.
+    head: ([u8; 32], u32), // largest round valid block received in correct time window
+    next: Either<BlockBuilder, BlockStreamer>, // builder if we are leading, streamer if we are not
+    txpool: HashSet<Signed<Txn>>, // cached txns
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -101,52 +156,46 @@ pub enum BlockError {
     BadTxnseq,
     BadTxn,
     BadState,
-    NoPrev
+    AlreadyStreaming,
+    AlreadyBuilding,
+    NotStreaming,
+    NotBuilding,
+    NoPrev,
+    NoBuilder,
+    BigBatch
 }
 
-impl<'a> Node<'a> {
-    // TODO: need to build async in the background and send at time cutoff
-    // TODO: selection for 2nd, 3rd, ... leaders (not impl here doe)
-    fn make_block(&self, propsal_no: u64) -> Block {
-        let round = self.head.1.block.sheader.msg.round + 1;
-        let timestamp = self.head.1.block.sheader.msg.timestamp + propsal_no * BLOCK_TIME;
-        let beacon = self.kp.sign(&self.head.1.block.sheader.msg.seed);
-        let seed = Sha256::digest(beacon).into();
-        let external = state::ExternalData { round, timestamp, seed };
-        let mut builder = BlockBuilder {
-            txnseq: MerkleMap::default(),
-            count: 0,
-            state: self.head.1.state.clone(),
-            external
-        };
-        for txn in self.txpool { // does this drain?
-            if let Err((txn, err)) = builder.add(txn) {
-                // TODO: decide when to remove from txpool
+impl Node {
+    fn head_snap(&self) -> &Snap {
+        &self.snaps[self.head.1 as usize][&self.head.0]
+    }
+
+    fn start_stream(&mut self, external: state::ExternalData) -> Result<(), BlockError> {
+        if let Either::Right(streamer) = self.next {
+            if streamer.external == external {
+                return Err(BlockError::AlreadyStreaming);
             }
         }
-        let header = Header {
-            round,
-            timestamp,
-            prev_hash: self.head.0,
-            state_commit: builder.state.commit(),
-            beacon,
-            txnseq_commit: builder.txnseq.commit(),
-            seed
-        };
-        let sig = self.kp.sign(&header);
-        Block {
-            sheader: Signed::<Header> {
-                msg: header,
-                from: self.kp.kp.public,
-                sig
-            },
-            txnseq: builder.txnseq
+        self.next = Either::Right(
+            BlockStreamer::new(
+                self.head_snap().state.clone(),
+                external
+            )
+        );
+        Ok(())
+    }
+
+    fn add_stream(&mut self, batch: Vec<Signed<Txn>>, batch_no: u32) -> Result<(), BlockError> {
+        if let Either::Right(mut streamer) = self.next {
+            streamer.add(batch, batch_no)
+        } else {
+            Err(BlockError::NotStreaming)
         }
     }
 
-    fn validate_block(&self, block: &Block) -> Result<(State, u64), BlockError> {
-        let header = block.sheader.msg;
-        if !block.sheader.verify() { return Err(BlockError::BadSig); }
+    fn finalize_stream(&mut self, sheader: Signed<Header>) -> Result<State, BlockError> {
+        let header = sheader.msg;
+        if !sheader.verify() { return Err(BlockError::BadSig); }
         let timestamp = state::timestamp();
         if timestamp > header.timestamp + MAX_CLOCK_GAP + MAX_PROP_TIME {
             return Err(BlockError::SmallTimestamp);
@@ -155,7 +204,7 @@ impl<'a> Node<'a> {
             return Err(BlockError::BigTimestamp);
         }
         let prev = self
-            .snaps[(header.round - 1) as usize % MAX_FORK]
+            .snaps[(header.round - 1 % MAX_FORK) as usize]
             .get(&header.prev_hash)
             .ok_or(BlockError::NoPrev)?;
         if header.round != prev.block.sheader.msg.round + 1 {
@@ -183,12 +232,7 @@ impl<'a> Node<'a> {
             timestamp: header.timestamp, 
             seed: header.seed
         };
-        let mut builder = BlockBuilder {
-            txnseq: MerkleMap::default(),
-            count: 0, // ugly
-            state: self.head.1.state.clone(),
-            external
-        };
+        let mut builder = BlockBuilder::new(self.head.1.state.clone(), external);
         for txn in block.txnseq.iter() {
             if builder.add(txn.clone()).is_err() {
                 return Err(BlockError::BadTxn);
@@ -200,12 +244,81 @@ impl<'a> Node<'a> {
         Ok((builder.state, timestamp))
     }
 
-    fn is_leader(&mut self, proposal_no: usize) -> bool {
-        self.head.1.state.leader(&self.head.1.block.sheader.msg.seed, proposal_no) == &self.kp.kp.public
+    fn start_build(&mut self, proposal: u32) -> Result<(), BlockError> {
+        let head_snap = self.head_snap();
+        let round = head_snap.block.sheader.msg.round + 1;
+        let timestamp = head_snap.block.sheader.msg.timestamp + proposal as u64 * BLOCK_TIME;
+        let beacon = self.kp.sign(&head_snap.block.sheader.msg.seed);
+        let seed = Sha256::digest(beacon).into();
+        let external = state::ExternalData { round, timestamp, seed };
+        if let Either::Left(builder) = self.next {
+            if builder.external == external {
+                return Err(BlockError::AlreadyBuilding);
+            }
+        }
+        self.next = Either::Left(
+            BlockBuilder::new(head_snap.state.clone(), external)
+        );
+        Ok(())
     }
 
+    fn add_build(&mut self, txn: Signed<Txn>) -> Result<Option<String>, BlockError> {
+        if let Either::Left(mut builder) = self.next {
+            if let Ok(opt_str) = builder.add(txn) {
+                Ok(opt_str)
+            } else {
+                Ok(None)
+            }
+        } else {
+            Err(BlockError::NotBuilding)
+        }
+    }
+
+    fn finalize_build(&self, proposal: u32) -> Result<(Option<String>, Block), BlockError> {
+        if let Either::Left(mut builder) = self.next {
+            let opt_str = builder.finalize();
+            let header = Header {
+                round: builder.external.round,
+                proposal,
+                timestamp: builder.external.timestamp,
+                prev_hash: self.head.0,
+                state_commit: builder.state.commit(),
+                beacon: self.kp.sign(&self.head_snap().block.sheader.msg.seed),
+                txnseq_commit: builder.txnseq.commit(),
+                seed: builder.external.seed
+            };
+            let sig = self.kp.sign(&header);
+            Ok((
+                opt_str,
+                Block {
+                    sheader: Signed::<Header> {
+                        msg: header,
+                        from: self.kp.kp.public,
+                        sig
+                    },
+                    txnseq: builder.txnseq
+                }
+            ))
+        } else {
+            Err(BlockError::NotBuilding)
+        }
+    }
+
+    fn validate_block(&self, block: &Block) -> Result<(State, u64), BlockError> {
+        
+    }
+
+    fn leader<'a>(&mut self, proposal_no: usize) -> &'a account::PublicKey {
+        let head_snap = self.head_snap();
+        head_snap.state.leader(&head_snap.block.sheader.msg.seed, proposal_no)
+    }
+
+    // todo
+    // tick function runs every blocktime from init to decide if we should send
+    // receive updates data structures with new block
+    /*
     fn send(&self) -> Option<Block> {
-        let 
+        if self.is_leader()
     }
 
     fn receive(&mut self, block: Block) {
@@ -213,9 +326,11 @@ impl<'a> Node<'a> {
             self.curr = Snapshot::new(block.sheader.msg, state);
         }
     }
+    */
 }
 
 fn main() {
+    /*
     // Simulating a simple synchronous network.
     let keypairs: [KeyPair; NUM_NODES] = core::array::from_fn(|_| gen());
 
@@ -280,5 +395,5 @@ fn main() {
         }
     }
     println!("Elapsed time: {} ms", now.elapsed().as_millis());
-
+    */
 }
