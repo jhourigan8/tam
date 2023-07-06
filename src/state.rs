@@ -5,107 +5,19 @@ use crate::merkle::MerkleMap;
 use crate::account::{self, Signed};
 use crate::validator;
 use crate::txn::Txn;
+use crate::block;
 
 pub const VALIDATOR_ROOT: account::Account = [0u8; 32];
 pub const VALIDATOR_SLOTS: u32 = 256;
 pub const VALIDATOR_STAKE: u32 = 1024;
 pub const NUM_SHARDS: u8 = 1;
 
-pub const TXN_BATCH_SIZE: usize = 128;
-pub const MAX_BLOCK_SIZE: usize = 1024;
-
-pub const JENNY_ACC_PK_BYTES: [u8; 32] = [
-    78, 236, 79, 93, 128, 157, 88, 31, 
-    180, 214, 106, 188, 148, 28, 247, 180, 
-    192, 230, 246, 236, 44, 60, 26, 166, 
-    80, 178, 25, 196, 255, 66, 189, 177
-];
-pub const JENNY_ACC_SK_BYTES: [u8; 32] = [
-    191, 138, 2, 115, 144, 114, 100, 247, 
-    67, 205, 70, 44, 129, 0, 4, 97, 
-    247, 20, 168, 62, 111, 208, 138, 117, 
-    205, 14, 172, 198, 231, 24, 204, 42
-];
-
 const _MAX_FORK: u32 = 128;
-
-#[derive(Debug, Clone)]
-pub struct BlockBuilder {
-    pub txnseq: MerkleMap<Signed<Txn>>,
-    pub batch: Vec<Signed<Txn>>,
-    pub count: u32,
-    pub state: State,
-    pub external: ExternalData
-}
-
-impl BlockBuilder {
-    pub fn new(state: State, external: ExternalData) -> Self {
-        Self {
-            txnseq: MerkleMap::default(),
-            batch: Vec::default(),
-            count: 0,
-            state,
-            external
-        }
-    }
-
-    pub fn flush(&mut self) -> String {
-        let str = serde_json::to_string(&self.batch).unwrap();
-        for txn in self.batch {
-            self.txnseq.insert(
-                &self.count.to_be_bytes(),
-                txn
-            );
-            self.count += 1;
-        }
-        str
-    }
-
-    pub fn add(&mut self, stxn: Signed<Txn>) -> Result<Option<String>, (Signed<Txn>, TxnError)> {
-        if self.count as usize + self.batch.len() == MAX_BLOCK_SIZE {
-            return Err((stxn, TxnError::FullBlock));
-        }
-        match self.state.apply(&stxn, &self.external) {
-            Ok(()) => {
-                self.batch.push(stxn);
-                if self.batch.len() == TXN_BATCH_SIZE {
-                    Ok(Some(self.flush()))
-                } else {
-                    Ok(None)
-                }
-            },
-            Err(txnerr) => {
-                Err((stxn, txnerr))
-            }
-        }
-    }
-
-    pub fn finalize(&mut self) -> Option<String> {
-        if self.batch.is_empty() {
-            None
-        } else {
-            Some(self.flush())
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct State {
     pub accounts: MerkleMap<account::Data>,
     pub validators: MerkleMap<validator::Data>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalData {
-    pub round: u32,
-    pub timestamp: u64,
-    pub seed: [u8; 32]
-}
-
-impl Default for ExternalData {
-    fn default() -> Self {
-        ExternalData { round: 0, timestamp: timestamp(), seed: [0u8; 32] }
-    }
 }
 
 impl Default for State {
@@ -114,10 +26,7 @@ impl Default for State {
             accounts: MerkleMap::default(),
             validators: MerkleMap::default(),
         };
-        let jenny_acc = account::Keypair { kp: ed25519_dalek::Keypair {
-            public: account::PublicKey::from_bytes(&JENNY_ACC_PK_BYTES).unwrap(),
-            secret: account::SecretKey::from_bytes(&JENNY_ACC_SK_BYTES).unwrap()
-        }};
+        let jenny_acc = account::Keypair::default();
         def.accounts.insert(
             &Sha256::digest(jenny_acc.kp.public.to_bytes()),
             account::Data { 
@@ -125,7 +34,16 @@ impl Default for State {
                 nonce: 0 
             }
         );
-        let mut bb = BlockBuilder::new(def, ExternalData::default());
+        let headerdata = block::Data::default();
+        let sig = jenny_acc.sign(&headerdata);
+        let mut bb = BlockBuilder::new(
+            def, 
+            Signed {
+                from: jenny_acc.kp.public,
+                msg: headerdata,
+                sig
+            }
+        );
         for _ in 0..VALIDATOR_SLOTS >> 1 {
             assert!(bb.add(jenny_acc.stake(&bb.state)).is_ok());
         }
@@ -145,6 +63,7 @@ pub enum TxnError {
     SmallNonce,
     BigNonce,
     FullBlock,
+    NoPreimage
 }
 
 pub enum Update {
@@ -153,9 +72,10 @@ pub enum Update {
 }
 
 impl State {
-    fn verify(&self, stxn: &Signed<Txn>, external: &ExternalData) -> Result<Vec<Update>, TxnError> {
+    fn verify(&self, stxn: &Signed<Txn>, headerdata: &block::Data) -> Result<Vec<Update>, TxnError> {
         let from_addy: [u8; 32] = Sha256::digest(&stxn.from.to_bytes()).into();
         let mut from_account = self.accounts.get(&from_addy)
+            .map_err(|_| TxnError::NoPreimage)?
             .ok_or(TxnError::BadFromPk)?
             .clone();
         if !stxn.verify() {
@@ -192,11 +112,11 @@ impl State {
                 if stxn.msg.amount != VALIDATOR_STAKE {
                     return Err(TxnError::InsuffStake);
                 }
-                if self.validators.get(&idx).is_some() {
+                if self.validators.get(&idx).map_err(|_| TxnError::NoPreimage)?.is_some() {
                     return Err(TxnError::BadStakeIdx);
                 }
                 let val_data = validator::Data { 
-                    round: external.round, 
+                    round: headerdata.round, 
                     owner: stxn.from.clone()
                 };
                 Ok(Vec::from([
@@ -208,7 +128,7 @@ impl State {
                     return Err(TxnError::InsuffStake);
                 }
                 from_account.bal += VALIDATOR_STAKE;
-                match self.validators.get(&idx) {
+                match self.validators.get(&idx).map_err(|_| TxnError::NoPreimage)? {
                     Some(stake_data) => {
                         if stake_data.owner != stxn.from {
                             return Err(TxnError::BadStakeIdx)
@@ -222,7 +142,7 @@ impl State {
                 ]))
             }
         } else {
-            match self.accounts.get(&stxn.msg.to) {
+            match self.accounts.get(&stxn.msg.to).map_err(|_| TxnError::NoPreimage)? {
                 Some(to_account) => {
                     let mut to_account = to_account.clone();
                     if from_addy != stxn.msg.to {
@@ -245,8 +165,8 @@ impl State {
         }
     }
 
-    pub fn apply<'a> (&mut self, stxn: &'a Signed<Txn>, external: &ExternalData) -> Result<(), TxnError> {
-        for up in self.verify(stxn, external)? {
+    pub fn apply<'a> (&mut self, stxn: &'a Signed<Txn>, headerdata: &block::Data) -> Result<(), TxnError> {
+        for up in self.verify(stxn, headerdata)? {
             match up {
                 Update::AccountUp(addy, opt_acc) => {
                     match opt_acc {
@@ -295,9 +215,15 @@ pub mod tests {
             public: account::PublicKey::from_bytes(&JENNY_ACC_PK_BYTES).unwrap(),
             secret: account::SecretKey::from_bytes(&JENNY_ACC_SK_BYTES).unwrap()
         }};
+        let headerdata = block::Data::default();
+        let sig = jenny_acc.sign(&headerdata);
         let builder = BlockBuilder::new(
             State::default(),
-            ExternalData::default()
+            Signed {
+                from: jenny_acc.kp.public,
+                msg: headerdata,
+                sig
+            }
         );
         (jenny_acc, builder)
     }

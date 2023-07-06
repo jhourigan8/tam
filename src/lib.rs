@@ -33,6 +33,7 @@ pub mod state;
 pub mod account;
 pub mod validator;
 pub mod txn;
+pub mod block;
 
 const NUM_NODES: usize = 8;
 const NUM_ROUNDS: usize = 100;
@@ -42,94 +43,6 @@ const MAX_FORK: u32 = 256;
 const BLOCK_TIME: u64 = 10_000; // ms
 const MAX_PROP_TIME: u64 = 250; 
 const MAX_CLOCK_GAP: u64 = 3_000; 
-
-#[derive(Debug, Clone, Serialize)]
-struct Header {
-    round: u32,
-    proposal: u32,
-    timestamp: u64,
-    prev_hash: [u8; 32],
-    state_commit: [u8; 32],
-    txnseq_commit: [u8; 32],
-    beacon: account::Signature,
-    seed: [u8; 32]
-}
-
-impl Header {
-    pub fn commit(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(self.round.to_be_bytes());
-        hasher.update(self.proposal.to_be_bytes());
-        hasher.update(self.timestamp.to_be_bytes());
-        hasher.update(self.prev_hash);
-        hasher.update(self.state_commit);
-        hasher.update(self.txnseq_commit);
-        hasher.update(self.beacon);
-        hasher.finalize().into()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Block {
-    sheader: account::Signed<Header>,
-    txnseq: MerkleMap<Signed<Txn>>
-}
-
-#[derive(Debug, Clone)]
-struct Snap {
-    block: Block,
-    state: State,
-    received_time: u64
-}
-
-#[derive(Debug, Clone)]
-struct BlockStreamer {
-    pub txnseq: MerkleMap<Signed<Txn>>,
-    pub count: u32,
-    pub state: State,
-    pub external: state::ExternalData,
-    next_batch: u32,
-    unprocessed_batches: HashMap<u32, Vec<Signed<Txn>>>,
-    num_batches: u32
-}
-
-impl BlockStreamer {
-    fn new(state: State, external: state::ExternalData) -> Self {
-        Self {
-            txnseq: MerkleMap::default(),
-            count: 0,
-            state,
-            external,
-            next_batch: 0,
-            unprocessed_batches: HashMap::default(),
-            num_batches: u32::MAX
-        }
-    }
-
-    fn add(&mut self, batch: Vec<Signed<Txn>>, batch_no: u32) -> Result<bool, BlockError> {
-        if batch_no >= self.next_batch {
-            self.unprocessed_batches.insert(batch_no, batch);
-        }
-        if batch_no > self.num_batches {
-            return Err(BlockError::BigBatch);
-        }
-        while let Some(batch) = self.unprocessed_batches.remove(&self.next_batch) {
-            for txn in batch {
-                if self.count as usize == state::MAX_BLOCK_SIZE {
-                    return Err(BlockError::BadTxn);
-                }
-                self.state.apply(&txn, &self.external)
-                    .map_err(|_| BlockError::BadTxn)?;
-            }
-            self.next_batch += 1;
-        }
-        if batch_no > num_batches {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-}
 
 // compute and build on only one chain
 // have code to resync on a fork: if longer chain pops up process seq of blocks
@@ -185,63 +98,16 @@ impl Node {
         Ok(())
     }
 
-    fn add_stream(&mut self, batch: Vec<Signed<Txn>>, batch_no: u32) -> Result<(), BlockError> {
+    fn add_stream(&mut self, batch: Vec<Signed<Txn>>, batch_no: u32) -> Result<bool, BlockError> {
         if let Either::Right(mut streamer) = self.next {
-            streamer.add(batch, batch_no)
+            streamer.add_batch(batch, batch_no)
         } else {
             Err(BlockError::NotStreaming)
         }
     }
 
     fn finalize_stream(&mut self, sheader: Signed<Header>) -> Result<State, BlockError> {
-        let header = sheader.msg;
-        if !sheader.verify() { return Err(BlockError::BadSig); }
-        let timestamp = state::timestamp();
-        if timestamp > header.timestamp + MAX_CLOCK_GAP + MAX_PROP_TIME {
-            return Err(BlockError::SmallTimestamp);
-        }
-        if timestamp + MAX_CLOCK_GAP < header.timestamp {
-            return Err(BlockError::BigTimestamp);
-        }
-        let prev = self
-            .snaps[(header.round - 1 % MAX_FORK) as usize]
-            .get(&header.prev_hash)
-            .ok_or(BlockError::NoPrev)?;
-        if header.round != prev.block.sheader.msg.round + 1 {
-            return Err(BlockError::BadRound);
-        }
-        if header.timestamp != prev.block.sheader.msg.timestamp + BLOCK_TIME  {
-            return Err(BlockError::BadBlockTime);
-        }
-        if block.sheader.from.verify(
-            &header.round.to_be_bytes(), 
-            &header.beacon
-        ).is_err() {
-            return Err(BlockError::BadBeacon);
-        }
-        let seed: [u8; 32] = Sha256::digest(&header.beacon).into();
-        if header.seed != seed {
-            return Err(BlockError::BadSeed)
-        }
-        if header.txnseq_commit != block.txnseq.commit() {
-            return Err(BlockError::BadTxnseq);
-        }
-        // TODO: check is leader
-        let external = state::ExternalData { 
-            round: header.round, 
-            timestamp: header.timestamp, 
-            seed: header.seed
-        };
-        let mut builder = BlockBuilder::new(self.head.1.state.clone(), external);
-        for txn in block.txnseq.iter() {
-            if builder.add(txn.clone()).is_err() {
-                return Err(BlockError::BadTxn);
-            }
-        }
-        if header.state_commit != builder.state.commit() {
-            return Err(BlockError::BadState);
-        }
-        Ok((builder.state, timestamp))
+        
     }
 
     fn start_build(&mut self, proposal: u32) -> Result<(), BlockError> {
@@ -274,7 +140,7 @@ impl Node {
         }
     }
 
-    fn finalize_build(&self, proposal: u32) -> Result<(Option<String>, Block), BlockError> {
+    fn finalize_build(&self, proposal: u32) -> Result<Block, BlockError> {
         if let Either::Left(mut builder) = self.next {
             let opt_str = builder.finalize();
             let header = Header {

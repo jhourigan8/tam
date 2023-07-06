@@ -13,6 +13,19 @@ pub type PublicKey = ed25519_dalek::PublicKey;
 pub type SecretKey = ed25519_dalek::SecretKey;
 pub type Signature = ed25519_dalek::Signature;
 
+pub const JENNY_PK_BYTES: [u8; 32] = [
+    78, 236, 79, 93, 128, 157, 88, 31, 
+    180, 214, 106, 188, 148, 28, 247, 180, 
+    192, 230, 246, 236, 44, 60, 26, 166, 
+    80, 178, 25, 196, 255, 66, 189, 177
+];
+pub const JENNY_SK_BYTES: [u8; 32] = [
+    191, 138, 2, 115, 144, 114, 100, 247, 
+    67, 205, 70, 44, 129, 0, 4, 97, 
+    247, 20, 168, 62, 111, 208, 138, 117, 
+    205, 14, 172, 198, 231, 24, 204, 42
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Data {
     pub bal: u32,
@@ -38,7 +51,7 @@ impl Keypair {
         let msg = Txn {
             to: Sha256::digest(to).into(),
             amount,
-            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().nonce,
+            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().unwrap().nonce,
             data: HashMap::default()
         };
         let sig = self.sign(&msg);
@@ -53,7 +66,7 @@ impl Keypair {
         let mut rng = rand::thread_rng();
         let idx = loop {
             let rand = rng.gen::<u32>() % VALIDATOR_SLOTS;
-            if state.validators.get(&rand.to_be_bytes()).is_none() {
+            if state.validators.get(&rand.to_be_bytes()).unwrap().is_none() {
                 break rand;
             }
         };
@@ -63,7 +76,7 @@ impl Keypair {
         let msg = Txn {
             to: VALIDATOR_ROOT,
             amount: VALIDATOR_STAKE,
-            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().nonce,
+            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().unwrap().nonce,
             data
         };
         let sig = self.sign(&msg);
@@ -78,7 +91,7 @@ impl Keypair {
         let mut rng = rand::thread_rng();
         let idx = loop {
             let rand = rng.gen::<u32>() % VALIDATOR_SLOTS;
-            if let Some(stake_data) = state.validators.get(&rand.to_be_bytes()) {
+            if let Some(stake_data) = state.validators.get(&rand.to_be_bytes()).unwrap() {
                 if stake_data.owner == self.kp.public {
                     break rand;
                 }
@@ -90,7 +103,7 @@ impl Keypair {
         let msg = Txn {
             to: VALIDATOR_ROOT,
             amount: 0,
-            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().nonce,
+            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().unwrap().nonce,
             data
         };
         let sig = self.sign(&msg);
@@ -99,6 +112,15 @@ impl Keypair {
             from: self.kp.public.clone(),
             sig
         }
+    }
+}
+
+impl Default for Keypair {
+    fn default() -> Self {
+        Keypair { kp: ed25519_dalek::Keypair {
+            public: PublicKey::from_bytes(&JENNY_PK_BYTES).unwrap(),
+            secret: SecretKey::from_bytes(&JENNY_SK_BYTES).unwrap()
+        } }
     }
 }
 
