@@ -2,13 +2,13 @@ use sha2::{Sha256, Digest};
 use core::array;
 use serde::{Serialize, Deserialize};
 use std::fmt::Debug;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct TrieNode<T> {
     substr: Vec<u8>,
     value: Option<T>,
-    children: Option<[Option<Rc<Node<T>>>; 16]>
+    children: Option<[Option<Arc<Node<T>>>; 16]>
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,11 +18,11 @@ pub struct Node<T> {
 }
 
 impl<T: Serialize + Clone> Node<T> {
-    fn empty_children_array() -> [Option<Rc<Node<T>>>; 16] {
+    fn empty_children_array() -> [Option<Arc<Node<T>>>; 16] {
         array::from_fn(|_| None)
     }
 
-    fn new(substr: Vec<u8>, value: Option<T>, children: Option<[Option<Rc<Node<T>>>; 16]>) -> Self {
+    fn new(substr: Vec<u8>, value: Option<T>, children: Option<[Option<Arc<Node<T>>>; 16]>) -> Self {
         let mut m = Node {
             node: Some( TrieNode {
                 substr,
@@ -56,11 +56,11 @@ impl<T: Serialize + Clone> Node<T> {
     // Can always unwrap children after split call
     fn split(&self, cut_at: usize) -> Result<Self, ()> {
         let mut clone = self.clone();
-        let mut node = clone.node.ok_or(())?;
+        let mut node = clone.node.as_mut().ok_or(())?;
         if cut_at < node.substr.len() {
             let suffix = node.substr.split_off(cut_at + 1);
             let mut children = Self::empty_children_array();
-            children[node.substr[cut_at] as usize] = Some(Rc::new(Self::new(
+            children[node.substr[cut_at] as usize] = Some(Arc::new(Self::new(
                 suffix, 
                 node.value.take(),
                 node.children.take()
@@ -78,14 +78,14 @@ impl<T: Serialize + Clone> Node<T> {
     // If I only have one child and no value absorb it into me.
     // Otherwise do nothing.
     fn unsplit(&mut self) -> Result<(), ()> {
-        let mut node = self.node.ok_or(())?;
+        let mut node = self.node.as_mut().ok_or(())?;
         if node.value.is_none() {
             if let Some(mut children) = node.children.take() {
                 let mut some_iter = children.iter_mut().enumerate().filter_map(|(i, opt_g)| opt_g.as_mut().map(|g| (i, g)));
                 let opt_child = some_iter.next();
                 if let (Some((i, child)), None) = (opt_child, some_iter.next()) {
                     node.substr.push(i as u8);
-                    let child_node = child.node.ok_or(())?;
+                    let child_node = child.node.as_ref().ok_or(())?;
                     node.substr.extend_from_slice(&child_node.substr);
                     node.children = child_node.children.clone();
                     node.value = child_node.value.clone();
@@ -99,20 +99,21 @@ impl<T: Serialize + Clone> Node<T> {
     }
 
     pub fn insert(&self, k: &[u8], v: T) -> Result<(Self, Option<T>), ()> {
-        let mut node = self.node.ok_or(())?;
+        let mut node = self.node.as_ref().ok_or(())?;
         let cut_at = Self::prefix_len(&k, &node.substr);
         let mut clone = self.split(cut_at)?;
+        let clone_node = clone.node.as_mut().unwrap();
         if k.len() > cut_at {
             // Key forks from `substr` or key continues after `substr`
             let suffix = &k[cut_at + 1..];
             let nibble = k[cut_at] as usize;
             if let Some(ref child) = node.children.as_ref().unwrap()[nibble] {
                 let (child_clone, opt_val) = child.insert(suffix, v)?;
-                node.children.as_mut().unwrap()[nibble] = Some(Rc::new(child_clone));
+                clone_node.children.as_mut().unwrap()[nibble] = Some(Arc::new(child_clone));
                 clone.commit = clone.commit();
                 Ok((clone, opt_val))
             } else {
-                node.children.as_mut().unwrap()[nibble] = Some(Rc::new(Self::new(
+                clone_node.children.as_mut().unwrap()[nibble] = Some(Arc::new(Self::new(
                     suffix.to_vec(), 
                     Some(v),
                     None
@@ -123,11 +124,11 @@ impl<T: Serialize + Clone> Node<T> {
         } else {
             if node.substr.len() > cut_at {
                 // Key contained in `substr`
-                node.value = Some(v);
+                clone_node.value = Some(v);
                 Ok((clone, None))
             } else {
                 // Key is `substr`
-                let opt_val = node.value.replace(v);
+                let opt_val = clone_node.value.replace(v);
                 clone.commit = clone.commit();
                 Ok((clone, opt_val))
             }
@@ -136,7 +137,7 @@ impl<T: Serialize + Clone> Node<T> {
 
     fn commit(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        let node = self.node.unwrap();
+        let node = self.node.as_ref().unwrap();
         hasher.update(&node.substr);
         if let Some(ref v) = node.value {
             hasher.update(serde_json::to_string(v).expect("can't serialize value"));
@@ -157,7 +158,7 @@ impl<T: Serialize + Clone> Node<T> {
     }
 
     fn remove(&self, k: &[u8]) -> Result<(Self, Option<T>), ()> {
-        let node = self.node.ok_or(())?;
+        let node = self.node.as_ref().ok_or(())?;
         let cut_at = Self::prefix_len(&k, &node.substr);
         if k.len() > cut_at { 
             if node.substr.len() > cut_at {
@@ -170,14 +171,14 @@ impl<T: Serialize + Clone> Node<T> {
                     let nibble = k[cut_at] as usize;
                     if let Some(ref child) = children[nibble] {
                         let mut clone = self.clone();
-                        let mut clone_node = clone.node.ok_or(())?;
+                        let mut clone_node = clone.node.as_mut().ok_or(())?;
                         let (child_clone, ret) = child.remove(suffix)?;
-                        let child_clone_node = child_clone.node.ok_or(())?;
+                        let child_clone_node = child_clone.node.as_ref().ok_or(())?;
                         if let (None, None) = (&child_clone_node.children, &child_clone_node.value) {
                             // child is empty, remove it
                             clone_node.children.as_mut().unwrap()[nibble] = None;
                         } else {
-                            clone_node.children.as_mut().unwrap()[nibble] = Some(Rc::new(child_clone));
+                            clone_node.children.as_mut().unwrap()[nibble] = Some(Arc::new(child_clone));
                         }
                         if clone_node.children.as_ref().unwrap().iter().filter(|g| g.is_some()).next().is_none() {
                             // children is empty, make it none.
@@ -200,7 +201,7 @@ impl<T: Serialize + Clone> Node<T> {
             } else {
                 // Key is `substr`
                 let mut clone = self.clone();
-                let mut clone_node = clone.node.ok_or(())?;
+                let clone_node = clone.node.as_mut().ok_or(())?;
                 let ret = clone_node.value.take();
                 clone.unsplit()?;
                 Ok((clone, ret))
@@ -209,7 +210,7 @@ impl<T: Serialize + Clone> Node<T> {
     }
 
     fn get(&self, k: &[u8]) -> Result<Option<&T>, ()> {
-        let node = self.node.ok_or(())?;
+        let node = self.node.as_ref().ok_or(())?;
         let cut_at = Self::prefix_len(k, &node.substr);
         if node.substr.len() > cut_at {
             // Key forks from `substr` or is contained in `substr`
@@ -269,12 +270,12 @@ impl<T: Serialize + Clone> Node<T> {
     // If true, include its entire subtree, else don't
     // Assumes have all state
     fn subtrie(&self, ks: Vec<(&[u8], bool)>) -> Option<Self> {
-        let mut recs = array::from_fn(|_| Vec::default());
+        let mut recs: [Vec<(&[u8], bool)>; 16] = array::from_fn(|_| Vec::default());
         let mut include_self = false;
         let mut include_kids = false;
         let mut clone = self.clone();
         for (k, kids) in ks {
-            let cut_at = Self::prefix_len(k, &self.node.unwrap().substr);
+            let cut_at = Self::prefix_len(k, &self.node.as_ref().unwrap().substr);
             if k.len() == cut_at {
                 include_self = true;
                 include_kids |= kids;
@@ -286,14 +287,14 @@ impl<T: Serialize + Clone> Node<T> {
             return Some(clone);
         }
         let mut include_any = include_self;
-        if let Some(ref mut children) = clone.node.unwrap().children {
-            for (idx, ref mut opt_child) in children.iter().enumerate() {
-                if recs[idx].is_empty() {
-                    *opt_child = &None;
+        if let Some(ref mut children) = clone.node.as_mut().unwrap().children {
+            for (opt_child, rec) in children.iter_mut().zip(recs.into_iter()) {
+                if rec.is_empty() {
+                    *opt_child = None;
                 } else {
                     include_any = true;
                     if let Some(child) = opt_child {
-                        *opt_child = &child.subtrie(recs[idx]).map(|s| Rc::new(s));
+                        *opt_child = child.subtrie(rec).map(|s| Arc::new(s));
                     }
                 }
             }
@@ -306,9 +307,10 @@ impl<T: Serialize + Clone> Node<T> {
     }
 
     // Update this merkle trie with data from another
-    pub fn update(&mut self, k: &[u8], mut other: Node<T>) -> Result<(), ()> {
-        let node = self.node.ok_or(())?;
+    pub fn update(&self, k: &[u8], mut other: Node<T>) -> Result<Self, ()> {
+        let node = self.node.as_ref().ok_or(())?;
         let cut_at = Self::prefix_len(k, &node.substr);
+        let mut clone = self.clone();
         if node.substr.len() > cut_at {
             // Key forks from `substr` or is contained in `substr`
             Err(())
@@ -326,9 +328,9 @@ impl<T: Serialize + Clone> Node<T> {
                 }
             } else {
                 // Key is `substr`
-                self.node = other.node.take();
-                self.commit = other.commit;
-                Ok(())
+                clone.node = other.node.take();
+                clone.commit = other.commit;
+                Ok(clone)
             }
         }
     }
@@ -338,8 +340,8 @@ impl<T: Serialize + Clone> Node<T> {
         if self.commit != self.commit() {
             Err(())
         } else {
-            if let Some(node) = self.node {
-                if let Some(children) = node.children {
+            if let Some(node) = self.node.as_ref() {
+                if let Some(ref children) = node.children {
                     for opt_child in children {
                         if let Some(child) = opt_child {
                             child.valid_commits()?;
@@ -364,7 +366,7 @@ impl<'a, T> MerkleIterator<'a, T> {
         while let Some((ref merk, ref explored)) = self.stack.pop() {
             self.stack.push((merk, true));
             if *explored { return; }
-            if let Some(ref children) = merk.node.unwrap().children {
+            if let Some(ref children) = merk.node.as_ref().unwrap().children {
                 for child in children.iter().rev().filter_map(|c| c.as_ref()) {
                     self.stack.push((child, false));
                 }
@@ -441,6 +443,9 @@ impl<V: Serialize + Clone> Map<V> {
         self.root.commit
     }
 
+    pub fn valid_commits(&self) -> Result<(), ()> {
+        self.root.valid_commits()
+    }
 }
 
 #[cfg(test)]

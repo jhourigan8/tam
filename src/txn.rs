@@ -2,8 +2,7 @@ use serde::{Serialize, Deserialize};
 use std::{fmt::Debug, collections::HashMap};
 use serde_big_array::BigArray;
 
-use crate::account;
-use crate::merkle;
+use crate::{account, merkle};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Txn {
@@ -14,13 +13,18 @@ pub struct Txn {
     pub data: HashMap<String, Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Txnseq {
-    pub seq: merkle::Map<account::Signed<Txn>>
-}
+pub type Seq = merkle::Map::<account::Signed::<Txn>>;
 
-impl Txnseq {
-    pub fn commit(&self) -> [u8; 32] {
-        self.seq.commit()
-    }
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Error {
+    BadFromPk,
+    BadSig,
+    BadStakeIdx,
+    BadMethod,
+    InsuffBal,
+    InsuffStake,
+    SmallNonce,
+    BigNonce,
+    FullBlock,
+    NoPreimage
 }

@@ -21,13 +21,6 @@ use ethnum::U256;
 use std::fmt::Debug;
 use std::time::UNIX_EPOCH;
 
-use crate::{
-    txn::Txn,
-    account::Signed,
-    merkle::MerkleMap,
-    state::{State, BlockBuilder}
-};
-
 pub mod merkle;
 pub mod state;
 pub mod account;
@@ -49,150 +42,79 @@ const MAX_CLOCK_GAP: u64 = 3_000;
 // to start resync just need to see longer valid header chain
 
 #[derive(Debug)]
-struct Node {
+struct Node<'a> {
     kp: account::Keypair,
-    snaps: [HashMap<[u8; 32], Snap>; MAX_FORK as usize], // self hash indexed.
-    head: ([u8; 32], u32), // largest round valid block received in correct time window
-    next: Either<BlockBuilder, BlockStreamer>, // builder if we are leading, streamer if we are not
-    txpool: HashSet<Signed<Txn>>, // cached txns
+    snaps: [HashMap<[u8; 32], block::Snap>; MAX_FORK as usize], // self hash indexed.
+    head: &'a block::Snap, // largest round valid block received in correct time window
+    opt_builder: Option<block::Builder::<'a>>,
+    txpool: HashSet<account::Signed<txn::Txn>>, // cached txns
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum BlockError {
-    BadSig,
-    BadRound,
-    BigTimestamp,
-    SmallTimestamp,
-    BadBlockTime,
-    BadBeacon,
-    BadSeed,
-    BadTxnseq,
-    BadTxn,
-    BadState,
-    AlreadyStreaming,
-    AlreadyBuilding,
-    NotStreaming,
-    NotBuilding,
-    NoPrev,
-    NoBuilder,
-    BigBatch
-}
-
-impl Node {
-    fn head_snap(&self) -> &Snap {
-        &self.snaps[self.head.1 as usize][&self.head.0]
+impl<'a> Node<'a> {
+    // timestamp tick!
+    // may return block to prop
+    fn tick(&'a mut self, time: u64) -> Option<String> {
+        let ret = match self.opt_builder.take() {
+            Some(builder) => {
+                let snap = builder.finalize();
+                let ser = serde_json::to_string(&snap.block).expect("can't serialize value");
+                self.add_snap(snap);
+                Some(ser)
+            },
+            None => None
+        };
+        let gap = time - self.head.block.sheader.msg.data.timestamp;
+        assert!(gap % BLOCK_TIME == 0);
+        let proposal = (gap / BLOCK_TIME) as u32;
+        let leader = self.head.leader(proposal).unwrap();
+        if leader == &self.kp.kp.public {
+            self.opt_builder = Some(block::Builder::<'a>::new(
+                &self.kp, proposal, self.head
+            ));
+        }
+        ret
     }
 
-    fn start_stream(&mut self, external: state::ExternalData) -> Result<(), BlockError> {
-        if let Either::Right(streamer) = self.next {
-            if streamer.external == external {
-                return Err(BlockError::AlreadyStreaming);
-            }
+    fn add_snap(&mut self, snap: block::Snap) {
+        assert!(snap.block.sheader.msg.data.round <= self.head.block.sheader.msg.data.round + 1);
+        if snap.block.sheader.msg.data.round == self.head.block.sheader.msg.data.round + 1 {
+            self.snaps[(snap.block.sheader.msg.data.round % MAX_FORK) as usize] = HashMap::default();
+            self.opt_builder = None;
         }
-        self.next = Either::Right(
-            BlockStreamer::new(
-                self.head_snap().state.clone(),
-                external
-            )
-        );
+        self.snaps[(snap.block.sheader.msg.data.round % MAX_FORK) as usize]
+            .insert(snap.block.sheader.msg.data.prev_hash, snap);
+    }
+
+    fn receive_chain(&mut self, chain: Vec<block::Block>) -> Result<(), block::Error> {
+        let first = chain.get(0).ok_or(block::Error::TooShort)?;
+        let last = chain.last().unwrap();
+        if last.sheader.msg.data.round <= self.head.block.sheader.msg.data.round {
+            return Err(block::Error::TooShort);
+        }
+        // last block has to be received at correct time
+        let timestamp = state::timestamp();
+        if timestamp > last.sheader.msg.data.timestamp + MAX_CLOCK_GAP + MAX_PROP_TIME {
+            return Err(block::Error::SmallTimestamp);
+        }
+        if timestamp + MAX_CLOCK_GAP < last.sheader.msg.data.timestamp {
+            return Err(block::Error::BigTimestamp);
+        }
+        let mut prev = self.snaps
+            [((first.sheader.msg.data.round - 1) % MAX_FORK) as usize]
+            .get(&first.sheader.msg.data.prev_hash)
+            .ok_or(block::Error::BadPrev)?;
+        let mut snaps = Vec::default();
+        for block in chain {
+            let verif = block::Verifier::new(prev, block);
+            let snap = verif.finalize()?;
+            snaps.push(snap);
+            prev = snaps.last().unwrap();
+        }
+        for snap in snaps {
+            self.add_snap(snap);
+        }
         Ok(())
     }
-
-    fn add_stream(&mut self, batch: Vec<Signed<Txn>>, batch_no: u32) -> Result<bool, BlockError> {
-        if let Either::Right(mut streamer) = self.next {
-            streamer.add_batch(batch, batch_no)
-        } else {
-            Err(BlockError::NotStreaming)
-        }
-    }
-
-    fn finalize_stream(&mut self, sheader: Signed<Header>) -> Result<State, BlockError> {
-        
-    }
-
-    fn start_build(&mut self, proposal: u32) -> Result<(), BlockError> {
-        let head_snap = self.head_snap();
-        let round = head_snap.block.sheader.msg.round + 1;
-        let timestamp = head_snap.block.sheader.msg.timestamp + proposal as u64 * BLOCK_TIME;
-        let beacon = self.kp.sign(&head_snap.block.sheader.msg.seed);
-        let seed = Sha256::digest(beacon).into();
-        let external = state::ExternalData { round, timestamp, seed };
-        if let Either::Left(builder) = self.next {
-            if builder.external == external {
-                return Err(BlockError::AlreadyBuilding);
-            }
-        }
-        self.next = Either::Left(
-            BlockBuilder::new(head_snap.state.clone(), external)
-        );
-        Ok(())
-    }
-
-    fn add_build(&mut self, txn: Signed<Txn>) -> Result<Option<String>, BlockError> {
-        if let Either::Left(mut builder) = self.next {
-            if let Ok(opt_str) = builder.add(txn) {
-                Ok(opt_str)
-            } else {
-                Ok(None)
-            }
-        } else {
-            Err(BlockError::NotBuilding)
-        }
-    }
-
-    fn finalize_build(&self, proposal: u32) -> Result<Block, BlockError> {
-        if let Either::Left(mut builder) = self.next {
-            let opt_str = builder.finalize();
-            let header = Header {
-                round: builder.external.round,
-                proposal,
-                timestamp: builder.external.timestamp,
-                prev_hash: self.head.0,
-                state_commit: builder.state.commit(),
-                beacon: self.kp.sign(&self.head_snap().block.sheader.msg.seed),
-                txnseq_commit: builder.txnseq.commit(),
-                seed: builder.external.seed
-            };
-            let sig = self.kp.sign(&header);
-            Ok((
-                opt_str,
-                Block {
-                    sheader: Signed::<Header> {
-                        msg: header,
-                        from: self.kp.kp.public,
-                        sig
-                    },
-                    txnseq: builder.txnseq
-                }
-            ))
-        } else {
-            Err(BlockError::NotBuilding)
-        }
-    }
-
-    fn validate_block(&self, block: &Block) -> Result<(State, u64), BlockError> {
-        
-    }
-
-    fn leader<'a>(&mut self, proposal_no: usize) -> &'a account::PublicKey {
-        let head_snap = self.head_snap();
-        head_snap.state.leader(&head_snap.block.sheader.msg.seed, proposal_no)
-    }
-
-    // todo
-    // tick function runs every blocktime from init to decide if we should send
-    // receive updates data structures with new block
-    /*
-    fn send(&self) -> Option<Block> {
-        if self.is_leader()
-    }
-
-    fn receive(&mut self, block: Block) {
-        if let Some(state) = self.validate_block(&block) {
-            self.curr = Snapshot::new(block.sheader.msg, state);
-        }
-    }
-    */
 }
 
 fn main() {

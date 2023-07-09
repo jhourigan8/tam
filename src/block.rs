@@ -6,27 +6,16 @@ use crate::account;
 use crate::merkle;
 use crate::state;
 use crate::txn;
+use crate::validator;
 
 pub const TXN_BATCH_SIZE: usize = 128;
 pub const MAX_BLOCK_SIZE: usize = 1024;
 
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct Header {
-    pub data: Data,
-    pub commits: Commits,
-}
+const BLOCK_TIME: u64 = 10_000; // ms
+const MAX_PROP_TIME: u64 = 250; 
+const MAX_CLOCK_GAP: u64 = 3_000; 
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Data {
-    pub prev_hash: [u8; 32],
-    pub round: u32,
-    pub proposal: u32,
-    pub timestamp: u64,
-    pub seed: [u8; 32],
-    pub beacon: account::Signature,
-}
-
-impl Default for Data {
+impl Default for Metadata {
     fn default() -> Self {
         let beacon = account::Keypair::default()
             .sign(&[0u8; 32]);
@@ -50,7 +39,7 @@ pub struct Commits {
 impl Default for Commits {
     fn default() -> Self {
         let state = state::State::default();
-        let txnseq = txn::Txnseq::default();
+        let txnseq = txn::Seq::default();
         Self { 
             state: state.commit(),
             txnseq: txnseq.commit()
@@ -58,43 +47,138 @@ impl Default for Commits {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Block {
-    sheader: account::Signed<Header>,
-    txnseq: txn::Txnseq
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct Header {
+    pub data: Metadata,
+    pub commits: Commits,
+}
+
+impl Header {
+    pub fn hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(&self.data.prev_hash);
+        hasher.update(&self.data.round.to_be_bytes());
+        hasher.update(&self.data.proposal.to_be_bytes());
+        hasher.update(&self.data.timestamp.to_be_bytes());
+        hasher.update(&self.data.seed);
+        hasher.update(&self.data.beacon);
+        hasher.update(&self.commits.state);
+        hasher.update(&self.commits.txnseq);
+        hasher.finalize().into()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Metadata {
+    pub prev_hash: [u8; 32],
+    pub round: u32,
+    pub proposal: u32,
+    pub timestamp: u64,
+    pub seed: [u8; 32],
+    pub beacon: account::Signature,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Block {
+    pub sheader: account::Signed<Header>,
+    pub txnseq: txn::Seq
+}
+
+impl Default for Block {
+    fn default() -> Self {
+        let msg = Header::default();
+        let kp = account::Keypair::default();
+        let sig = kp.sign(&msg);
+        let from = kp.kp.public;
+        Self {
+            sheader: account::Signed::<Header> { msg, from, sig },
+            txnseq: txn::Seq::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Error {
+    BadSig,
+    BadRound,
+    BigTimestamp,
+    SmallTimestamp,
+    BadBlockTime,
+    BadBeacon,
+    BadSeed,
+    BadTxnseq,
+    BadTxn,
+    BadState,
+    AlreadyStreaming,
+    AlreadyBuilding,
+    NotStreaming,
+    NotBuilding,
+    BadPrev,
+    NoBuilder,
+    NotLeader,
+    BigBatch,
+    TooShort
 }
 
 #[derive(Debug, Clone)]
-struct Snap {
-    block: Block,
-    state: state::State,
+pub struct Snap {
+    pub block: Block,
+    pub block_hash: [u8; 32],
+    pub state: state::State,
+}
+
+impl Default for Snap {
+    fn default() -> Self {
+        let block = Block::default();
+        let block_hash = block.sheader.msg.hash();
+        Self { block, block_hash, state: state::State::default() }
+    }
+}
+
+impl Snap {
+    pub fn leader (&self, proposal: u32) -> Result<&account::PublicKey, txn::Error> {
+        validator::leader(&self.block.sheader.msg.data.seed, &self.state.validators, proposal)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Builder<'a> {
     pub kp: &'a account::Keypair,
-    pub txnseq: txn::Txnseq,
+    pub txnseq: merkle::Map::<account::Signed::<txn::Txn>>,
     pub batch: u32,
     pub count: u32,
     pub state: state::State,
-    pub headerdata: Data
+    pub metadata: Metadata
 }
 
 impl<'a> Builder<'a> {
-    pub fn new(kp: &'a account::Keypair, state: state::State, headerdata: Data) -> Self {
+    pub fn new(kp: &'a account::Keypair, proposal: u32, head: &'a Snap) -> Self {
+        let timestamp = head.block.sheader.msg.data.timestamp + 1_000 * crate::BLOCK_TIME * (proposal as u64);
+        let beacon = kp.sign(&head.block.sheader.msg.data.seed);
+        let seed = Sha256::digest(beacon).into();
+        let metadata = Metadata {
+            prev_hash: head.block_hash,
+            round: head.block.sheader.msg.data.round + 1,
+            proposal,
+            timestamp,
+            seed,
+            beacon
+        };
         Self {
             kp,
-            txnseq: txn::Txnseq::default(),
+            txnseq: txn::Seq::default(),
             count: 0,
             batch: 0,
-            state,
-            headerdata
+            state: head.state.clone(),
+            metadata
         }
     }
 
-    pub fn add(&mut self, stxn: account::Signed<txn::Txn>) -> Result<(), (account::Signed<txn::Txn>, state::TxnError)> {
-        match self.state.apply(&stxn, &self.headerdata) {
+    pub fn add(&mut self, stxn: account::Signed<txn::Txn>) -> Result<(), (account::Signed<txn::Txn>, txn::Error)> {
+        match self.state.apply(&stxn, &self.metadata) {
             Ok(()) => {
+                let idx = (self.batch as u64) << 32 | (self.count as u64);
+                self.txnseq.insert(&idx.to_be_bytes(), stxn);
                 self.count += 1;
                 if self.count == TXN_BATCH_SIZE as u32 {
                     self.count = 0;
@@ -108,36 +192,39 @@ impl<'a> Builder<'a> {
         }
     }
 
-    pub fn finalize(&self) -> Block {
+    pub fn finalize(self) -> Snap {
         let header = Header {
-            data: self.headerdata,
+            data: self.metadata,
             commits: Commits {
                 state: self.state.commit(),
                 txnseq: self.txnseq.commit()
             }
         };
+        let block_hash = header.hash();
         let sig = self.kp.sign(&header);
-        Block {
+        let block = Block {
             sheader: account::Signed::<Header> {
                 msg: header,
                 from: self.kp.kp.public,
                 sig
             },
             txnseq: self.txnseq.clone()
-        }
+        };
+        Snap { block, block_hash, state: self.state }
     }
 }
 
 
 #[derive(Debug, Clone)]
-struct Verifier<'a> {
+pub struct Verifier<'a> {
     pub head: &'a Snap,
-    pub block: Block
+    pub block: Block,
+    pub batch: u32
 }
 
 impl<'a> Verifier<'a> {
-    fn new(head: &Snap, block: Block) -> Self {
-        Self { head, block }
+    pub fn new(head: &'a Snap, block: Block) -> Self {
+        Self { head, block, batch: 0 }
     }
 
     // possible alternative later: streaming build
@@ -172,59 +259,49 @@ impl<'a> Verifier<'a> {
     }
     */
 
-    fn finalize(self) -> Result<Block, BlockError> {
-        let sheader = self.sheader.unwrap();
-        let header = sheader.msg;
-        if !sheader.verify() { return Err(BlockError::BadSig); }
-        let timestamp = state::timestamp();
-        if timestamp > header.timestamp + MAX_CLOCK_GAP + MAX_PROP_TIME {
-            return Err(BlockError::SmallTimestamp);
+    pub fn finalize(self) -> Result<Snap, Error> {
+        let sheader = &self.block.sheader;
+        let header = &sheader.msg;
+        if !sheader.verify() { return Err(Error::BadSig); }
+        if header.data.round != self.head.block.sheader.msg.data.round + 1 {
+            return Err(Error::BadRound);
         }
-        if timestamp + MAX_CLOCK_GAP < header.timestamp {
-            return Err(BlockError::BigTimestamp);
+        if header.data.timestamp != self.head.block.sheader.msg.data.timestamp + (header.data.proposal as u64) * BLOCK_TIME  {
+            return Err(Error::BadBlockTime);
         }
-        let prev = self
-            .snaps[(header.round - 1 % MAX_FORK) as usize]
-            .get(&header.prev_hash)
-            .ok_or(BlockError::NoPrev)?;
-        if header.round != prev.block.sheader.msg.round + 1 {
-            return Err(BlockError::BadRound);
+        if header.data.prev_hash != self.head.block_hash {
+            return Err(Error::BadPrev)
         }
-        if header.timestamp != prev.block.sheader.msg.timestamp + BLOCK_TIME  {
-            return Err(BlockError::BadBlockTime);
-        }
-        if sheader.from.verify(
-            &header.round.to_be_bytes(), 
-            &header.beacon
-        ).is_err() {
-            return Err(BlockError::BadBeacon);
-        }
-        let seed: [u8; 32] = Sha256::digest(&header.beacon).into();
-        if header.seed != seed {
-            return Err(BlockError::BadSeed)
-        }
-        if header.txnseq_commit != self.txnseq.commit() {
-            return Err(BlockError::BadTxnseq);
-        }
-        // TODO: check is leader
-        let external = state::ExternalData { 
-            round: header.round, 
-            timestamp: header.timestamp, 
-            seed: header.seed
+        let sbeacon = account::Signed::<[u8; 32]> {
+            msg: self.head.block.sheader.msg.data.seed,
+            from: sheader.from.clone(),
+            sig: header.data.beacon
         };
-        let mut builder = BlockBuilder::new(self.head.1.state.clone(), external);
-        for txn in block.txnseq.iter() {
-            if builder.add(txn.clone()).is_err() {
-                return Err(BlockError::BadTxn);
-            }
+        if !sbeacon.verify() {
+            return Err(Error::BadBeacon);
         }
-        if header.state_commit != builder.state.commit() {
-            return Err(BlockError::BadState);
+        let seed: [u8; 32] = Sha256::digest(&header.data.beacon).into();
+        if header.data.seed != seed {
+            return Err(Error::BadSeed)
         }
-        Ok((builder.state, timestamp))
-        Block {
-            sheader: self.header.unwrap(),
-            txnseq: self.txnseq
+        if header.commits.txnseq != self.block.txnseq.commit() {
+            return Err(Error::BadTxnseq);
         }
+        self.block.txnseq.valid_commits().map_err(|_| Error::BadTxnseq)?;
+        let leader = self.head.leader(
+            header.data.proposal
+        ).unwrap();
+        if leader != &sheader.from {
+            return Err(Error::NotLeader);
+        }
+        let mut state = self.head.state.clone();
+        for txn in self.block.txnseq.iter() {
+            state.apply(txn, &header.data).map_err(|_| Error::BadTxn)?;
+        }
+        if header.commits.state != state.commit() {
+            return Err(Error::BadState);
+        }
+        let block_hash = self.block.sheader.msg.hash();
+        Ok( Snap { block: self.block, block_hash, state } )
     }
 }

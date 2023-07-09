@@ -1,17 +1,12 @@
 use blst::BLST_ERROR;
 use ed25519_dalek::{Signer, Verifier};
-use tammany::{
-    merkle::MerkleMap, 
-    state::State, 
-    account,
-    validator
-};
+use tammany::*;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use sha2::{Sha256, Digest};
 
 fn merkle_map(crit: &mut Criterion) {
-    let mut node_copy: MerkleMap<usize> = MerkleMap::default();
+    let mut node_copy: merkle::Map<usize> = merkle::Map::default();
     crit.bench_function("merkle map copy insert 10k", |b| b.iter(|| {
         for i in 1usize..10_000 {
             node_copy.insert(&i.to_be_bytes(), i);
@@ -37,21 +32,11 @@ fn merkle_map(crit: &mut Criterion) {
         }
     }));
 
-    let alice = account::Keypair::gen();
-    let mut state = State {
-        accounts: MerkleMap::default(),
-        validators: MerkleMap::default(),
-        round: 0,
-        seed: [0u8; 32]
-    };
-    state.accounts.insert(
-        &Sha256::digest(alice.kp.public.to_bytes()),
-        account::Data { bal: 1 << 17, nonce: 0 }
-    );
+    let (alice, snap) = <(account::Keypair, block::Snap)>::default();
+    let mut builder = block::Builder::new(&alice, 1, &snap);
     let bob = account::Keypair::gen();
     crit.bench_function("state payment", |b| b.iter(|| {
-        let mut state = state.clone();
-        assert!(state.apply(&alice.send(bob.kp.public, 1, &state)).is_ok());
+        assert!(builder.add(alice.send(bob.kp.public, 1, &builder.state)).is_ok());
     }));
 }
 
@@ -63,14 +48,6 @@ fn sigs(crit: &mut Criterion) {
     }));
     crit.bench_function("eddsa verify", |b| b.iter(|| {
         assert!(alice.kp.public.verify(b"message", &sig).is_ok());
-    }));
-    let alice = tammany::validator::Keypair::gen();
-    let sig = alice.sk.sign(b"message", &[], &[]);
-    crit.bench_function("bls sign", |b| b.iter(|| {
-        let _ = alice.sk.sign(b"message", &[], &[]);
-    }));
-    crit.bench_function("bls verify", |b| b.iter(|| {
-        assert_eq!(sig.verify(true, b"message", &[], &[], &alice.pk, true), BLST_ERROR::BLST_SUCCESS);
     }));
 }
 
