@@ -2,6 +2,7 @@ use ed25519_dalek::{self, Verifier, Signer};
 use rand::Rng;
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
+use std::collections::BTreeMap;
 use std::{fmt::Debug, collections::HashMap};
 use rand::rngs::OsRng;
 
@@ -52,7 +53,7 @@ impl Keypair {
             to: Sha256::digest(to).into(),
             amount,
             nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().unwrap().nonce,
-            data: HashMap::default()
+            data: BTreeMap::default()
         };
         let sig = self.sign(&msg);
         Signed::<Txn> {
@@ -70,7 +71,7 @@ impl Keypair {
                 break rand;
             }
         };
-        let mut data = HashMap::default();
+        let mut data = BTreeMap::default();
         data.insert(String::from("idx"), Vec::from(idx.to_be_bytes()));
         data.insert(String::from("method"), b"stake".to_vec());
         let msg = Txn {
@@ -97,7 +98,7 @@ impl Keypair {
                 }
             }
         };
-        let mut data = HashMap::default();
+        let mut data = BTreeMap::default();
         data.insert(String::from("idx"), Vec::from(idx.to_be_bytes()));
         data.insert(String::from("method"), b"unstake".to_vec());
         let msg = Txn {
@@ -129,6 +130,24 @@ pub struct Signed<T> {
     pub msg: T,
     pub from: PublicKey,
     pub sig: Signature
+}
+
+impl<T: PartialOrd> PartialOrd for Signed<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let  opt_cmp = self.msg.partial_cmp(&other.msg);
+        if let Some(cmp) = opt_cmp {
+            if cmp.is_ne() { return Some(cmp); }
+        }
+        let cmp = self.from.to_bytes().cmp(&other.from.to_bytes());
+        if cmp.is_ne() { return Some(cmp); }
+        Some(self.sig.to_bytes().cmp(&other.sig.to_bytes()))
+    }
+}
+
+impl<T: PartialOrd + Eq> Ord for Signed<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(&other).unwrap()
+    }
 }
 
 impl<T: Serialize> Signed<T> {

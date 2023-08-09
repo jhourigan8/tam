@@ -4,14 +4,14 @@ use serde::{Serialize, Deserialize};
 use std::fmt::Debug;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct TrieNode<T> {
     substr: Vec<u8>,
     value: Option<T>,
     children: Option<[Option<Arc<Node<T>>>; 16]>
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Node<T> {
     node: Option<TrieNode<T>>, // None for serialize and send
     commit: [u8; 32]
@@ -99,7 +99,7 @@ impl<T: Serialize + Clone> Node<T> {
     }
 
     pub fn insert(&self, k: &[u8], v: T) -> Result<(Self, Option<T>), ()> {
-        let mut node = self.node.as_ref().ok_or(())?;
+        let node = self.node.as_ref().ok_or(())?;
         let cut_at = Self::prefix_len(&k, &node.substr);
         let mut clone = self.split(cut_at)?;
         let clone_node = clone.node.as_mut().unwrap();
@@ -107,7 +107,7 @@ impl<T: Serialize + Clone> Node<T> {
             // Key forks from `substr` or key continues after `substr`
             let suffix = &k[cut_at + 1..];
             let nibble = k[cut_at] as usize;
-            if let Some(ref child) = node.children.as_ref().unwrap()[nibble] {
+            if let Some(ref child) = clone_node.children.as_ref().unwrap()[nibble] {
                 let (child_clone, opt_val) = child.insert(suffix, v)?;
                 clone_node.children.as_mut().unwrap()[nibble] = Some(Arc::new(child_clone));
                 clone.commit = clone.commit();
@@ -125,6 +125,7 @@ impl<T: Serialize + Clone> Node<T> {
             if node.substr.len() > cut_at {
                 // Key contained in `substr`
                 clone_node.value = Some(v);
+                clone.commit = clone.commit();
                 Ok((clone, None))
             } else {
                 // Key is `substr`
@@ -338,6 +339,7 @@ impl<T: Serialize + Clone> Node<T> {
     // verify hash integrity fn
     pub fn valid_commits(&self) -> Result<(), ()> {
         if self.commit != self.commit() {
+            println!("commit is {:?} should be {:?}", self.commit, self.commit());
             Err(())
         } else {
             if let Some(node) = self.node.as_ref() {
@@ -396,7 +398,7 @@ impl<'a, T> Iterator for MerkleIterator<'a, T> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Map<V> {
     root: Node<V>
 }
@@ -420,14 +422,14 @@ impl<V: Serialize + Clone> Map<V> {
     }
 
     pub fn insert(&mut self, k: &[u8], v: V) -> Result<Option<V>, ()> {
-        let mut opt_val = None;
-        (self.root, opt_val) = self.root.insert(&Self::to_digest(k), v)?;
+        let (root, opt_val) = self.root.insert(&Self::to_digest(k), v)?;
+        self.root = root;
         Ok(opt_val)
     }
 
     pub fn remove(&mut self, k: &[u8]) -> Result<Option<V>, ()> {
-        let mut opt_val = None;
-        (self.root, opt_val) = self.root.remove(&Self::to_digest(k))?;
+        let (root, opt_val) = self.root.remove(&Self::to_digest(k))?;
+        self.root = root;
         Ok(opt_val)
     }
 
@@ -453,11 +455,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn insert_node() {
-        println!("{:?}", 0u32.to_be_bytes());
-        let mut node: Node<u8> = Node::default();
-        let mut opt_val = None;
-        (node, opt_val) = node.insert(&[0, 1, 2, 3], 0).unwrap();
+    fn insert() {
+        let (mut node, mut opt_val) = Node::default().insert(&[0, 1, 2, 3], 0).unwrap();
         assert_eq!(opt_val, None);
         // Key contained in parent path
         (node, opt_val) =node.insert(&[0, 1, 2], 1).unwrap();
@@ -497,13 +496,13 @@ mod tests {
         assert_eq!(opt_val, Some(1));
         (node, opt_val) = node.insert(&[0, 1, 2], 0).unwrap();
         assert_eq!(opt_val, Some(2));
-        (node, opt_val) = node.insert(&[5, 6, 7], 0).unwrap();
+        (_, opt_val) = node.insert(&[5, 6, 7], 0).unwrap();
         assert_eq!(opt_val, Some(5));
     }
 
     #[test]
-    fn get_node() {
-        let mut node = Node::default()
+    fn get() {
+        let node = Node::default()
             .insert(&[0, 1, 0], 0).unwrap().0
             .insert(&[0, 1, 2, 3, 4], 1).unwrap().0
             .insert(&[1], 2).unwrap().0
@@ -531,16 +530,15 @@ mod tests {
     }
 
     #[test]
-    fn remove_node() {
-        let mut node: Node<u8> = Node::default()
+    fn remove() {
+        let node: Node<u8> = Node::default()
             .insert(&[], 0).unwrap().0
             .insert(&[0, 1, 2, 3, 4], 1).unwrap().0
             .insert(&[0, 1, 2, 5, 6, 7], 2).unwrap().0
             .insert(&[0, 2, 4], 3).unwrap().0
             .insert(&[0, 2, 3, 4], 4).unwrap().0;
-        let mut opt_val = None;
         // Key contained in parent path
-        (node, opt_val) = node.remove(&[0, 1, 2, 3]).unwrap();
+        let (mut node, mut opt_val) = node.remove(&[0, 1, 2, 3]).unwrap();
         assert_eq!(opt_val, None);
         (node, opt_val) = node.remove(&[0, 2, 3]).unwrap();
         assert_eq!(opt_val, None);
@@ -564,12 +562,12 @@ mod tests {
         assert_eq!(opt_val, Some(0));
         (node, opt_val) = node.remove(&[0, 2, 4]).unwrap();
         assert_eq!(opt_val, Some(3));
-        (node, opt_val) = node.remove(&[0, 2]).unwrap();
+        (_, opt_val) = node.remove(&[0, 2]).unwrap();
         assert_eq!(opt_val, None);
     }
 
     #[test]
-    fn commit_node() {
+    fn commit() {
         let mut node: Node<u8> = Node::default();
         let mut commits1 = [[0u8; 32]; 7];
         commits1[0] = node.commit;
@@ -578,7 +576,6 @@ mod tests {
         node = node.insert(&[0, 1, 2, 3], 1).unwrap().0;
         commits1[2] = node.commit;
         node = node.insert(&[0, 1, 2, 3, 4, 5], 2).unwrap().0;
-        println!("{:?}", node.get(&[0, 1, 2, 3, 4, 5]));
         commits1[3] = node.commit;
         node = node.insert(&[1, 2, 3, 4, 5], 3).unwrap().0;
         commits1[4] = node.commit;
@@ -604,8 +601,6 @@ mod tests {
 
         assert_eq!(commits1, commits2);
         for i in 0..7 {
-            println!("{:?}", commits1[i]);
-            println!("{:?}", commits2[i]);
             for j in 0..i {
                 assert_ne!(commits1[i], commits1[j]);
             }
@@ -613,8 +608,8 @@ mod tests {
     }
 
     #[test]
-    fn iter_node() {
-        let mut node: Node<u8> = Node::default()
+    fn iter() {
+        let node: Node<u8> = Node::default()
             .insert(&[], 0).unwrap().0
             .insert(&[0, 1, 2, 3], 1).unwrap().0
             .insert(&[0, 1, 2, 3, 4, 5], 2).unwrap().0
@@ -623,6 +618,25 @@ mod tests {
             .insert(&[2], 5).unwrap().0;
         let vals: Vec<&u8> = node.iter().collect();
         assert_eq!(vals, Vec::from([&2, &1, &3, &4, &5, &0]));
+    }
+
+    #[test]
+    fn validcommits() {
+        // Don't really test for errors but the code is pretty obviously correct for error catching?
+        let mut node: Node<u8> = Node::default();
+        assert_eq!(node.valid_commits(), Ok(()));
+        node = node.insert(&[], 0).unwrap().0;
+        assert_eq!(node.valid_commits(), Ok(()));
+        node = node.insert(&[0, 1, 2, 3, 4, 5], 2).unwrap().0;
+        assert_eq!(node.valid_commits(), Ok(()));
+        node = node.insert(&[1, 2, 3, 4, 5], 3).unwrap().0;
+        assert_eq!(node.valid_commits(), Ok(()));
+        node.commit = [0u8; 32];
+        assert_eq!(node.valid_commits(), Err(()));
+        node = node.insert(&[1, 2, 3, 4, 6], 4).unwrap().0;
+        assert_eq!(node.valid_commits(), Ok(()));
+        node = node.insert(&[2], 5).unwrap().0;
+        assert_eq!(node.valid_commits(), Ok(()));
     }
     
 }

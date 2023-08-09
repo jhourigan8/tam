@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use serde::Serialize;
 use sha2::Sha256;
 use digest::Digest;
@@ -11,9 +12,7 @@ use crate::validator;
 pub const TXN_BATCH_SIZE: usize = 128;
 pub const MAX_BLOCK_SIZE: usize = 1024;
 
-const BLOCK_TIME: u64 = 10_000; // ms
-const MAX_PROP_TIME: u64 = 250; 
-const MAX_CLOCK_GAP: u64 = 3_000; 
+pub const BLOCK_TIME: u64 = 1_000; // ms
 
 impl Default for Metadata {
     fn default() -> Self {
@@ -30,7 +29,7 @@ impl Default for Metadata {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Commits {
     pub state: [u8; 32],
     pub txnseq: [u8; 32],
@@ -47,7 +46,7 @@ impl Default for Commits {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Header {
     pub data: Metadata,
     pub commits: Commits,
@@ -68,7 +67,7 @@ impl Header {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Metadata {
     pub prev_hash: [u8; 32],
     pub round: u32,
@@ -78,7 +77,23 @@ pub struct Metadata {
     pub beacon: account::Signature,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl Metadata {
+    pub fn new(kp: &account::Keypair, proposal: u32, head: &Snap) -> Self {
+        let timestamp = head.block.sheader.msg.data.timestamp + BLOCK_TIME * (proposal as u64);
+        let beacon = kp.sign(&head.block.sheader.msg.data.seed);
+        let seed = Sha256::digest(beacon).into();
+        Metadata {
+            prev_hash: head.block_hash,
+            round: head.block.sheader.msg.data.round + 1,
+            proposal,
+            timestamp,
+            seed,
+            beacon
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Block {
     pub sheader: account::Signed<Header>,
     pub txnseq: txn::Seq
@@ -97,30 +112,20 @@ impl Default for Block {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Error {
     BadSig,
     BadRound,
-    BigTimestamp,
-    SmallTimestamp,
     BadBlockTime,
     BadBeacon,
     BadSeed,
     BadTxnseq,
-    BadTxn,
+    BadTxn(account::Signed<txn::Txn>, txn::Error),
     BadState,
-    AlreadyStreaming,
-    AlreadyBuilding,
-    NotStreaming,
-    NotBuilding,
-    BadPrev,
-    NoBuilder,
     NotLeader,
-    BigBatch,
-    TooShort
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snap {
     pub block: Block,
     pub block_hash: [u8; 32],
@@ -136,14 +141,13 @@ impl Default for Snap {
 }
 
 impl Snap {
-    pub fn leader (&self, proposal: u32) -> Result<&account::PublicKey, txn::Error> {
+    pub fn leader(&self, proposal: u32) -> Result<&account::PublicKey, txn::Error> {
         validator::leader(&self.block.sheader.msg.data.seed, &self.state.validators, proposal)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Builder<'a> {
-    pub kp: &'a account::Keypair,
+pub struct Builder {
     pub txnseq: merkle::Map::<account::Signed::<txn::Txn>>,
     pub batch: u32,
     pub count: u32,
@@ -151,26 +155,14 @@ pub struct Builder<'a> {
     pub metadata: Metadata
 }
 
-impl<'a> Builder<'a> {
-    pub fn new(kp: &'a account::Keypair, proposal: u32, head: &'a Snap) -> Self {
-        let timestamp = head.block.sheader.msg.data.timestamp + 1_000 * crate::BLOCK_TIME * (proposal as u64);
-        let beacon = kp.sign(&head.block.sheader.msg.data.seed);
-        let seed = Sha256::digest(beacon).into();
-        let metadata = Metadata {
-            prev_hash: head.block_hash,
-            round: head.block.sheader.msg.data.round + 1,
-            proposal,
-            timestamp,
-            seed,
-            beacon
-        };
+impl Builder {
+    pub fn new(kp: &account::Keypair, proposal: u32, head: &Snap) -> Self {
         Self {
-            kp,
             txnseq: txn::Seq::default(),
             count: 0,
             batch: 0,
             state: head.state.clone(),
-            metadata
+            metadata: Metadata::new(kp, proposal, head)
         }
     }
 
@@ -178,7 +170,9 @@ impl<'a> Builder<'a> {
         match self.state.apply(&stxn, &self.metadata) {
             Ok(()) => {
                 let idx = (self.batch as u64) << 32 | (self.count as u64);
-                self.txnseq.insert(&idx.to_be_bytes(), stxn);
+                assert!(
+                    self.txnseq.insert(&idx.to_be_bytes(), stxn).is_ok()
+                );
                 self.count += 1;
                 if self.count == TXN_BATCH_SIZE as u32 {
                     self.count = 0;
@@ -192,7 +186,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    pub fn finalize(self) -> Snap {
+    pub fn finalize(self, kp: &account::Keypair) -> Snap {
         let header = Header {
             data: self.metadata,
             commits: Commits {
@@ -201,11 +195,11 @@ impl<'a> Builder<'a> {
             }
         };
         let block_hash = header.hash();
-        let sig = self.kp.sign(&header);
+        let sig = kp.sign(&header);
         let block = Block {
             sheader: account::Signed::<Header> {
                 msg: header,
-                from: self.kp.kp.public,
+                from: kp.kp.public,
                 sig
             },
             txnseq: self.txnseq.clone()
@@ -259,18 +253,16 @@ impl<'a> Verifier<'a> {
     }
     */
 
-    pub fn finalize(self) -> Result<Snap, Error> {
+    pub fn finalize(self) -> Result<Snap, (Block, Error)> {
         let sheader = &self.block.sheader;
         let header = &sheader.msg;
-        if !sheader.verify() { return Err(Error::BadSig); }
+        assert_eq!(header.data.prev_hash, self.head.block_hash);
+        if !sheader.verify() { return Err((self.block, Error::BadSig)); }
         if header.data.round != self.head.block.sheader.msg.data.round + 1 {
-            return Err(Error::BadRound);
+            return Err((self.block, Error::BadRound));
         }
         if header.data.timestamp != self.head.block.sheader.msg.data.timestamp + (header.data.proposal as u64) * BLOCK_TIME  {
-            return Err(Error::BadBlockTime);
-        }
-        if header.data.prev_hash != self.head.block_hash {
-            return Err(Error::BadPrev)
+            return Err((self.block, Error::BadBlockTime));
         }
         let sbeacon = account::Signed::<[u8; 32]> {
             msg: self.head.block.sheader.msg.data.seed,
@@ -278,30 +270,225 @@ impl<'a> Verifier<'a> {
             sig: header.data.beacon
         };
         if !sbeacon.verify() {
-            return Err(Error::BadBeacon);
+            return Err((self.block, Error::BadBeacon));
         }
         let seed: [u8; 32] = Sha256::digest(&header.data.beacon).into();
         if header.data.seed != seed {
-            return Err(Error::BadSeed)
+            return Err((self.block, Error::BadSeed));
         }
         if header.commits.txnseq != self.block.txnseq.commit() {
-            return Err(Error::BadTxnseq);
+            return Err((self.block, Error::BadTxnseq));
         }
-        self.block.txnseq.valid_commits().map_err(|_| Error::BadTxnseq)?;
+        if self.block.txnseq.valid_commits().is_err() {
+            return Err((self.block, Error::BadTxnseq));
+        }
         let leader = self.head.leader(
             header.data.proposal
         ).unwrap();
         if leader != &sheader.from {
-            return Err(Error::NotLeader);
+            return Err((self.block, Error::NotLeader));
         }
         let mut state = self.head.state.clone();
         for txn in self.block.txnseq.iter() {
-            state.apply(txn, &header.data).map_err(|_| Error::BadTxn)?;
+            if let Err(e) = state.apply(txn, &header.data) {
+                let txn_clone = txn.clone();
+                return Err((self.block, Error::BadTxn(txn_clone, e)));
+            }
         }
         if header.commits.state != state.commit() {
-            return Err(Error::BadState);
+            return Err((self.block, Error::BadState));
         }
         let block_hash = self.block.sheader.msg.hash();
         Ok( Snap { block: self.block, block_hash, state } )
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+
+    use std::collections::{HashMap, BTreeMap};
+    use super::*;
+
+    /*
+    BadSig,
+    BadRound,
+    BigTimestamp,
+    SmallTimestamp,
+    BadBlockTime,
+    BadBeacon,
+    BadSeed,
+    BadTxnseq,
+    BadTxn,
+    BadState,f
+    BadPrev,
+    NotLeader
+     */
+
+    fn setup() -> (account::Keypair, account::Keypair, Vec<account::Signed<txn::Txn>>) {
+        let alice = account::Keypair::default();
+        let bob = account::Keypair::gen();
+        let mut vec = Vec::default();
+        for i in 0..128 {
+            let txn = txn::Txn {
+                to: bob.kp.public.to_bytes(),
+                amount: 1, 
+                nonce: i + (state::VALIDATOR_SLOTS >> 1),
+                data: BTreeMap::default()
+            };
+            let sig = alice.sign(&txn);
+            vec.push(account::Signed::<txn::Txn> {
+                msg: txn,
+                from: alice.kp.public,
+                sig
+            });
+        }
+        (alice, bob, vec)
+    }
+
+    #[test]
+    fn ok() {
+        let (alice, _, txns) = setup();
+        let head = Snap::default();
+        let mut builder = Builder::new(&alice, 1, &head);
+        for txn in txns {
+            assert_eq!(builder.add(txn), Ok(()));
+        }
+        let block = builder.finalize(&alice).block;
+        let verifier = Verifier::new(&head, block);
+        assert!(verifier.finalize().is_ok());
+    }
+
+    #[test]
+    fn badsig() {
+        let (alice, _, txns) = setup();
+        let head = Snap::default();
+        let mut builder = Builder::new(&alice, 1, &head);
+        for txn in txns {
+            assert_eq!(builder.add(txn), Ok(()));
+        }
+        let mut block = builder.finalize(&alice).block;
+        block.sheader.sig = alice.sign(&b"other text");
+        let verifier = Verifier::new(&head, block);
+        assert_eq!(verifier.finalize().map_err(|(_, e)| e), Err(Error::BadSig));
+    }
+
+    #[test]
+    fn badround() {
+        let (alice, _, txns) = setup();
+        let mut head = Snap::default();
+        head.block.sheader.msg.data.round += 1;
+        let mut builder = Builder::new(&alice, 1, &head);
+        for txn in txns {
+            assert_eq!(builder.add(txn), Ok(()));
+        }
+        let block = builder.finalize(&alice).block;
+        head.block.sheader.msg.data.round -= 1;
+        let verifier = Verifier::new(&head, block);
+        assert_eq!(verifier.finalize().map_err(|(_, e)| e), Err(Error::BadRound));
+    }
+
+    #[test]
+    fn badblocktime() {
+        let (alice, _, txns) = setup();
+        let mut head = Snap::default();
+        head.block.sheader.msg.data.timestamp += 1_000;
+        let mut builder = Builder::new(&alice, 1, &head);
+        for txn in txns {
+            assert_eq!(builder.add(txn), Ok(()));
+        }
+        let block = builder.finalize(&alice).block;
+        head.block.sheader.msg.data.timestamp -= 1_000;
+        let verifier = Verifier::new(&head, block);
+        assert_eq!(verifier.finalize().map_err(|(_, e)| e), Err(Error::BadBlockTime));
+    }
+
+    #[test]
+    fn badbeacon() {
+        let (alice, _, txns) = setup();
+        let head = Snap::default();
+        let mut builder = Builder::new(&alice, 1, &head);
+        builder.metadata.beacon = alice.sign(b"other data");
+        for txn in txns {
+            assert_eq!(builder.add(txn), Ok(()));
+        }
+        let block = builder.finalize(&alice).block;
+        let verifier = Verifier::new(&head, block);
+        assert_eq!(verifier.finalize().map_err(|(_, e)| e), Err(Error::BadBeacon));
+    }
+
+    #[test]
+    fn badseed() {
+        let (alice, _, txns) = setup();
+        let head = Snap::default();
+        let mut builder = Builder::new(&alice, 1, &head);
+        builder.metadata.seed = [0u8; 32];
+        for txn in txns {
+            assert_eq!(builder.add(txn), Ok(()));
+        }
+        let block = builder.finalize(&alice).block;
+        let verifier = Verifier::new(&head, block);
+        assert_eq!(verifier.finalize().map_err(|(_, e)| e), Err(Error::BadSeed));
+    }
+
+    #[test]
+    fn badtxnseq() {
+        let (alice, _, txns) = setup();
+        let head = Snap::default();
+        let mut builder = Builder::new(&alice, 1, &head);
+        for txn in txns {
+            assert_eq!(builder.add(txn), Ok(()));
+        }
+        let mut block = builder.finalize(&alice).block;
+        block.sheader.msg.commits.txnseq = [0u8; 32];
+        block.sheader.sig = alice.sign(&block.sheader.msg);
+        let verifier = Verifier::new(&head, block);
+        assert_eq!(verifier.finalize().map_err(|(_, e)| e), Err(Error::BadTxnseq));
+    }
+
+    #[test]
+    fn badtxn() {
+        let (alice, bob, txns) = setup();
+        let head = Snap::default();
+        let mut builder = Builder::new(&alice, 1, &head);
+        for txn in txns {
+            assert_eq!(builder.add(txn), Ok(()));
+        }
+        let bad = alice.send(
+            bob.kp.public, 
+            state::VALIDATOR_STAKE * state::VALIDATOR_SLOTS, 
+            &builder.state
+        );
+        assert_eq!(builder.txnseq.insert(&[0u8], bad.clone()), Ok(None));
+        let block = builder.finalize(&alice).block;
+        let verifier = Verifier::new(&head, block);
+        assert_eq!(verifier.finalize().map_err(|(_, e)| e), Err(Error::BadTxn(bad, txn::Error::InsuffBal)));
+    }
+
+    #[test]
+    fn badstate() {
+        let (alice, _, txns) = setup();
+        let head = Snap::default();
+        let mut builder = Builder::new(&alice, 1, &head);
+        for txn in txns {
+            assert_eq!(builder.add(txn), Ok(()));
+        }
+        let mut block = builder.finalize(&alice).block;
+        block.sheader.msg.commits.state = [0u8; 32];
+        block.sheader.sig = alice.sign(&block.sheader.msg);
+        let verifier = Verifier::new(&head, block);
+        assert_eq!(verifier.finalize().map_err(|(_, e)| e), Err(Error::BadState));
+    }
+
+    #[test]
+    fn notleader() {
+        let (_, bob, txns) = setup();
+        let head = Snap::default();
+        let mut builder = Builder::new(&bob, 1, &head);
+        for txn in txns {
+            assert_eq!(builder.add(txn), Ok(()));
+        }
+        let block = builder.finalize(&bob).block;
+        let verifier = Verifier::new(&head, block);
+        assert_eq!(verifier.finalize().map_err(|(_, e)| e), Err(Error::NotLeader));
     }
 }

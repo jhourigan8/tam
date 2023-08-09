@@ -1,3 +1,4 @@
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Sha256, Digest};
@@ -14,7 +15,7 @@ pub const NUM_SHARDS: u8 = 1;
 
 const _MAX_FORK: u32 = 128;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct State {
     pub accounts: merkle::Map<account::Data>,
     pub validators: merkle::Map<validator::Data>,
@@ -27,12 +28,14 @@ impl Default for State {
             validators: merkle::Map::default(),
         };
         let jenny_acc = account::Keypair::default();
-        state.accounts.insert(
-            &Sha256::digest(jenny_acc.kp.public.to_bytes()),
-            account::Data { 
-                bal: (VALIDATOR_SLOTS * VALIDATOR_STAKE) >> 1, 
-                nonce: 0 
-            }
+        assert!(
+            state.accounts.insert(
+                &Sha256::digest(jenny_acc.kp.public.to_bytes()),
+                account::Data { 
+                    bal: VALIDATOR_SLOTS * VALIDATOR_STAKE, 
+                    nonce: 0 
+                }
+            ).is_ok()
         );
         let meta = block::Metadata {
             prev_hash: [0u8; 32],
@@ -43,7 +46,12 @@ impl Default for State {
             beacon: jenny_acc.sign(&[0u8; 32])
         };
         for _ in 0..VALIDATOR_SLOTS >> 1 {
-            state.apply(&jenny_acc.stake(&state), &meta);
+            assert!(
+                state.apply(
+                    &jenny_acc.stake(&state), 
+                    &meta
+                ).is_ok()
+            );
         }
         state
     }
@@ -55,7 +63,7 @@ pub enum Update {
 }
 
 impl State {
-    fn verify(&self, stxn: &account::Signed<txn::Txn>, headerdata: &block::Metadata) -> Result<Vec<Update>, txn::Error> {
+    pub fn verify(&self, stxn: &account::Signed<txn::Txn>, headerdata: &block::Metadata) -> Result<Vec<Update>, txn::Error> {
         let from_addy: [u8; 32] = Sha256::digest(&stxn.from.to_bytes()).into();
         let mut from_account = self.accounts.get(&from_addy)
             .map_err(|_| txn::Error::NoPreimage)?
@@ -185,7 +193,7 @@ pub fn timestamp() -> u64 {
 
 #[cfg(test)]
 pub mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, BTreeMap};
 
     use super::*;
 
@@ -227,7 +235,6 @@ pub mod tests {
             .is_ok()
         );
         let old_accs = old.accounts.iter().collect::<Vec<&account::Data>>();
-        println!("{:?}", &&account::Data { bal: (VALIDATOR_SLOTS * VALIDATOR_STAKE) >> 1, nonce: VALIDATOR_SLOTS >> 1 });
         assert!(old_accs.contains(&&account::Data { bal: (VALIDATOR_SLOTS * VALIDATOR_STAKE) >> 1, nonce: VALIDATOR_SLOTS >> 1 })); // alice
         let new_accs = builder.state.accounts.iter().collect::<Vec<&account::Data>>();
         assert!(new_accs.contains(&&account::Data { bal: ((VALIDATOR_SLOTS * VALIDATOR_STAKE) >> 1) - (1 << 15) - (1 << 5) - (1 << 8), nonce: 3 + (VALIDATOR_SLOTS >> 1) })); // alice
@@ -288,7 +295,7 @@ pub mod tests {
             to: Sha256::digest(alice.kp.public.to_bytes()).into(),
             amount: 1,
             nonce: 0,
-            data: HashMap::default()
+            data: BTreeMap::default()
         };
         assert_eq!(
             builder.add(account::Signed::<txn::Txn> {
@@ -310,7 +317,7 @@ pub mod tests {
             to: Sha256::digest(bob.kp.public.to_bytes()).into(),
             amount: 1,
             nonce: VALIDATOR_SLOTS >> 1,
-            data: HashMap::default()
+            data: BTreeMap::default()
         };
         assert_eq!(
             builder.add(account::Signed::<txn::Txn> {
@@ -324,13 +331,13 @@ pub mod tests {
             to: Sha256::digest(bob.kp.public.to_bytes()).into(),
             amount: 1,
             nonce: VALIDATOR_SLOTS >> 1,
-            data: HashMap::default()
+            data: BTreeMap::default()
         };
         let other_msg = txn::Txn {
             to: Sha256::digest(bob.kp.public.to_bytes()).into(),
             amount: 2,
             nonce: VALIDATOR_SLOTS >> 1,
-            data: HashMap::default()
+            data: BTreeMap::default()
         };
         assert_eq!(
             builder.add(account::Signed::<txn::Txn> {
@@ -346,7 +353,7 @@ pub mod tests {
     fn badstakeidx() {
         let (alice, snap) = <(account::Keypair, block::Snap)>::default();
         let mut builder = block::Builder::new(&alice, 1, &snap);
-        let mut data = HashMap::default();
+        let mut data = BTreeMap::default();
         data.insert(
             String::from("idx"), 
             alice.unstake(&builder.state).msg.data.get("idx").unwrap().clone()
@@ -369,7 +376,7 @@ pub mod tests {
             }).map_err(|e| e.1), 
             Err(txn::Error::BadStakeIdx)
         );
-        let mut data = HashMap::default();
+        let mut data = BTreeMap::default();
         data.insert(
             String::from("idx"), 
             alice.stake(&builder.state).msg.data.get("idx").unwrap().clone()
@@ -398,7 +405,7 @@ pub mod tests {
     fn badmethod() {
         let (alice, snap) = <(account::Keypair, block::Snap)>::default();
         let mut builder = block::Builder::new(&alice, 1, &snap);
-        let mut data = HashMap::default();
+        let mut data = BTreeMap::default();
         data.insert(
             String::from("idx"), 
             alice.stake(&builder.state).msg.data.get("idx").unwrap().clone()
@@ -419,7 +426,7 @@ pub mod tests {
         );
         let (alice, snap) = <(account::Keypair, block::Snap)>::default();
         let mut builder = block::Builder::new(&alice, 1, &snap);
-        let mut data = HashMap::default();
+        let mut data = BTreeMap::default();
         data.insert(
             String::from("idx"), 
             alice.stake(&builder.state).msg.data.get("idx").unwrap().clone()
@@ -459,7 +466,7 @@ pub mod tests {
     fn insuffstake() {
         let (alice, snap) = <(account::Keypair, block::Snap)>::default();
         let mut builder = block::Builder::new(&alice, 1, &snap);
-        let mut data = HashMap::default();
+        let mut data = BTreeMap::default();
         data.insert(
             String::from("idx"), 
             alice.stake( &builder.state).msg.data.get("idx").unwrap().clone()
