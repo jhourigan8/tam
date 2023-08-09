@@ -2,18 +2,14 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::mem;
 use core::array;
-use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use tokio::sync::Mutex;
 use std::fmt::Debug;
 
 use crate::{block, state, txn, account};
 
-const NUM_NODES: usize = 8;
-const NUM_ROUNDS: usize = 100;
-const LEADER_DELAY: usize = 20;
-const MAX_FORK: u32 = 256;
 
+const MAX_FORK: u32 = 256;
 const MAX_PROP_TIME: u64 = 250; 
 const MAX_CLOCK_GAP: u64 = 300; 
 
@@ -251,11 +247,10 @@ impl Node {
 
 #[cfg(test)]
 pub mod tests {
-    use std::{thread::sleep, time::{Duration, SystemTime, UNIX_EPOCH}};
+    use std::{thread::sleep, time::Duration};
     use sha2::{Sha256, Digest};
     
     use tokio::time;
-    use crate::validator;
 
     use crate::block::BLOCK_TIME;
 
@@ -278,8 +273,8 @@ pub mod tests {
         println!("init gang {:?}", state::timestamp());
         interval.tick().await;
         println!("block0 gang {:?}", state::timestamp());
-        let mut alice = Node::new(account::Keypair::default(), gen.clone());
-        let mut bob = Node::new(account::Keypair::gen(), gen.clone());
+        let alice = Node::new(account::Keypair::default(), gen.clone());
+        let bob = Node::new(account::Keypair::gen(), gen.clone());
         alice.tick().await;
         bob.tick().await;
         (interval, alice, bob)
@@ -287,7 +282,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn bigtimestamp() {
-        let (_, mut alice, mut bob) = setup().await;
+        let (_, alice, bob) = setup().await;
         println!("It's {:?}", state::timestamp());
         // Don't wait long enough.
         sleep(Duration::from_millis((block::BLOCK_TIME - MAX_CLOCK_GAP) >> 1));
@@ -299,7 +294,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn smalltimestamp() {
-        let (_, mut alice, mut bob) = setup().await;
+        let (_, alice, bob) = setup().await;
         // Wait too long.
         sleep(Duration::from_millis(BLOCK_TIME + MAX_CLOCK_GAP + MAX_PROP_TIME + 1_000));
         let bcast = alice.tick().await.expect("Alice should lead");
@@ -309,7 +304,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn badprev() {
-        let (mut interval, mut alice, mut bob) = setup().await;
+        let (mut interval, alice, bob) = setup().await;
         interval.tick().await;
         let _ = alice.tick().await.expect("Alice should lead");
         assert_eq!(bob.tick().await, None);
@@ -321,9 +316,9 @@ pub mod tests {
 
     #[tokio::test]
     async fn tooshort() {
-        let (mut interval, mut alice, mut bob) = setup().await;
+        let (mut interval, alice, bob) = setup().await;
         let head = { alice.head.lock().await.clone() };
-        let mut evil_alice = Node::new(account::Keypair::default(), head);
+        let evil_alice = Node::new(account::Keypair::default(), head);
         evil_alice.tick().await;
         let state = { (evil_alice.head.lock().await).state.clone() };
         evil_alice.receive(serde_json::to_string(
@@ -347,7 +342,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn ok() {
-        let (mut interval, mut alice, mut bob) = setup().await;
+        let (mut interval, alice, bob) = setup().await;
         interval.tick().await;
         println!("block1 gang {:?}", state::timestamp());
         let bcast = alice.tick().await.expect("Alice should lead");

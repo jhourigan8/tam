@@ -3,7 +3,7 @@ use rand::Rng;
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
 use std::collections::BTreeMap;
-use std::{fmt::Debug, collections::HashMap};
+use std::fmt::Debug;
 use rand::rngs::OsRng;
 
 use crate::state::{State, VALIDATOR_SLOTS, VALIDATOR_STAKE, VALIDATOR_ROOT};

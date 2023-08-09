@@ -1,4 +1,3 @@
-use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Sha256, Digest};
@@ -193,7 +192,7 @@ pub fn timestamp() -> u64 {
 
 #[cfg(test)]
 pub mod tests {
-    use std::collections::{HashMap, BTreeMap};
+    use std::collections::BTreeMap;
 
     use super::*;
 

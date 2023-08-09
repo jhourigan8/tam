@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use std::{fmt::Debug, collections::{HashMap, BTreeMap}};
+use std::{fmt::Debug, collections::BTreeMap};
 use serde_big_array::BigArray;
 
 use crate::{account, merkle};

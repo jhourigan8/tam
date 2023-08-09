@@ -267,6 +267,7 @@ impl<T: Serialize + Clone> Node<T> {
         MerkleIterator { stack: Vec::from([(self, false)]) }
     }
 
+    /*
     // Get subtrie only containing data at ks
     // If true, include its entire subtree, else don't
     // Assumes have all state
@@ -306,6 +307,7 @@ impl<T: Serialize + Clone> Node<T> {
             None
         }
     }
+    */
 
     // Update this merkle trie with data from another
     pub fn update(&self, k: &[u8], mut other: Node<T>) -> Result<Self, ()> {

@@ -305,8 +305,7 @@ impl<'a> Verifier<'a> {
 
 #[cfg(test)]
 pub mod tests {
-
-    use std::collections::{HashMap, BTreeMap};
+    use std::collections::BTreeMap;
     use super::*;
 
     /*
