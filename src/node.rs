@@ -6,7 +6,7 @@ use serde::{Serialize, Deserialize};
 use tokio::sync::Mutex;
 use std::fmt::Debug;
 
-use crate::{block, state, txn, account};
+use crate::{block, state, txn, account, app, msg};
 
 
 const MAX_FORK: u32 = 256;
@@ -17,23 +17,10 @@ const MAX_CLOCK_GAP: u64 = 300;
 // have code to resync on a fork: if longer chain pops up process seq of blocks
 // to start resync just need to see longer valid header chain
 
-#[derive(Serialize, Deserialize)]
-pub enum Message {
-    Blocks(Vec<block::Block>),
-    Txns(Vec<account::Signed<txn::Txn>>)
-}
-#[derive(Serialize, Deserialize)]
-enum Error {
-    BadBlock(block::Block, block::Error),
-    BigTimestamp,
-    SmallTimestamp,
-    BadPrev,
-    TooShort
-}
-
 #[derive(Debug)]
 pub struct Node { // TODO: acquire locks in total order so we never deadcock
     pub kp: account::Keypair,
+    pub nonce: Mutex<u32>, // own nonce. may be ahead of nonce on chain
     pub snaps: [Mutex<HashMap<[u8; 32], block::Snap>>; MAX_FORK as usize], // self hash indexed.
     pub head: Mutex<block::Snap>, // largest round valid block received in correct time window
     pub opt_builder: Mutex<Option<block::Builder>>,
@@ -41,7 +28,7 @@ pub struct Node { // TODO: acquire locks in total order so we never deadcock
 }
 
 impl Node {
-    pub fn new(kp: account::Keypair, genesis: block::Snap) -> Self {
+    pub fn new(kp: account::Keypair, genesis: block::Snap, nonce: u32) -> Self {
         let snaps = array::from_fn(|i| {
             let mut map = HashMap::default();
             if i == 0 { 
@@ -51,6 +38,7 @@ impl Node {
         });
         Self {
             kp,
+            nonce: Mutex::new(nonce),
             snaps,
             head: Mutex::new(genesis),
             opt_builder: Mutex::new(None),
@@ -65,7 +53,7 @@ impl Node {
     // timestamp tick!
     // may return block to prop
     // time can be a little bit after exact tick moment
-    pub async fn tick(&self) -> Option<String> {
+    pub async fn tick(&self) -> Option<msg::Serialized<msg::chain::Broadcast>> {
         let mut empty_builder = None;
         {
             let mut opt_builder = self.opt_builder.lock().await;
@@ -73,16 +61,11 @@ impl Node {
         }
         let ret = match empty_builder {
             Some(builder) => {
-                let mut snap = builder.finalize(&self.kp);
-                let prop = Message::Blocks(Vec::from([snap.block]));
-                let ser = serde_json::to_string(&prop).expect("can't serialize value");
-                if let Message::Blocks(mut vecy) = prop {
-                    snap.block = vecy.pop().unwrap();
-                    self.add_snap(snap).await;
-                    Some(ser)
-                } else {
-                    panic!("unreachable")
-                }
+                let snap = builder.finalize(&self.kp);
+                let req = msg::chain::Broadcast { chain: Vec::from([snap.block.clone()]) };
+                let prop = msg::Serialized::new(&req);
+                self.add_snap(snap).await;
+                Some(prop)
             },
             None => None
         };
@@ -96,9 +79,7 @@ impl Node {
         let gap = time - head.block.sheader.msg.data.timestamp.min(time);
         let proposal = (gap / block::BLOCK_TIME) as u32 + 1;
         let leader = head.leader(proposal).unwrap();
-        println!("{:?} has seed {:?} and says leader is {:?}", self.kp.kp.public.as_bytes()[0], head.block.sheader.msg.data.seed[0], leader.as_bytes()[0]);
         let mut new_builder = if leader == &self.kp.kp.public {
-            println!("{:?} ready to lead next", self.kp.kp.public.as_bytes()[0]);
             let mut builder = block::Builder::new(
                 &self.kp, proposal, &head
             );
@@ -145,83 +126,102 @@ impl Node {
         arr.insert(snap.block.sheader.msg.hash(), snap);
     }
 
-    async fn receive_txns(&self, txns: Vec<account::Signed<txn::Txn>>) -> Option<String> {
+    pub async fn receive_txns(&self, txns: msg::txn::Broadcast) -> 
+        (msg::Serialized<Result<(), msg::txn::Error>>, Option<msg::Serialized<msg::txn::Broadcast>>)
+    {
+        let txns = txns.txns;
         let head = self.head.lock().await;
         let meta = block::Metadata::new(&self.kp, 1, &head);
         let mut valid = Vec::default();
+        let mut txpool = self.txpool.lock().await;
+        // Keep txns which pass or have big nonce (TODO: need to flush txpool...)
         match *self.opt_builder.lock().await {
             Some(ref mut builder) => {
-                // Building keep rule: no pool just try to add
                 for txn in txns {
-                    let _ = builder.add(txn.clone());
+                    if let Err((txn, err)) = builder.add(txn.clone()) {
+                        if err == txn::Error::BigNonce {
+                            if !(*txpool).contains(&txn) {
+                                if head.state.verify(&txn, &meta).is_ok() {
+                                    valid.push(txn);
+                                }
+                            }
+                        }
+                    }
                 }
             },
             None => {
-                // Not building keep rule
                 for txn in txns {
-                    let txpool = self.txpool.lock().await;
                     if !(*txpool).contains(&txn) {
-                        if head.state.verify(&txn, &meta).is_ok() {
-                            valid.push(txn);
+                        match head.state.verify(&txn, &meta) {
+                            Ok(_) | Err(txn::Error::BigNonce) => valid.push(txn),
+                            _ => {} ,
                         }
                     }
                 }
             }
         }
+        let resp = msg::Serialized::new(&Ok::<(), msg::txn::Error>(()));
         if valid.is_empty() {
-            None
+            (resp, None)
         } else {
-            let prop = Message::Txns(valid);
-            let ser = serde_json::to_string(&prop).expect("can't serialize value");
-            if let Message::Txns(vecy) = prop {
-                let mut txpool = self.txpool.lock().await;
-                for txn in vecy {
-                    (*txpool).insert(txn);
-                }
-            } else {
-                panic!("unreachable")
+            let req = msg::txn::Broadcast { txns: valid };
+            let prop = msg::Serialized::new(&req);
+            for txn in req.txns {
+                (*txpool).insert(txn);
             }
-            Some(ser)
+            (resp, Some(prop))
         }
     }
 
-    async fn receive_chain(&self, chain: Vec<block::Block>) -> Result<(), Error> {
-        let first = chain.get(0).ok_or(Error::TooShort)?;
+    async fn process_chain(&self, mut chain: Vec<block::Block>) -> 
+        Result<Option<msg::Serialized<msg::chain::Broadcast>>, msg::chain::Error> 
+    {
+        // Drop anything that isn't new.
+        let mut first = chain.get(0).ok_or(msg::chain::Error::AlreadyHave)?;
+        while self.snaps[(first.sheader.msg.data.round % MAX_FORK) as usize]
+            .lock()
+            .await
+            .contains_key(&first.sheader.msg.hash()) {
+                chain.remove(0);
+                first = chain.get(0).ok_or(msg::chain::Error::AlreadyHave)?;
+        }
         let last = chain.last().unwrap();
-        let forked = {
+        let (forked, new_head) = {
             let head = self.head.lock().await;
             // println!("received {:#?} and head is {:#?}", first.sheader.msg, head.block.sheader.msg);
             if last.sheader.msg.data.round <= head.block.sheader.msg.data.round {
-                return Err(Error::TooShort);
+                return Err(msg::chain::Error::TooShort);
             }
-            first.sheader.msg.data.prev_hash != head.block_hash
+            (
+                first.sheader.msg.data.prev_hash != head.block_hash, 
+                last.sheader.msg.data.round > head.block.sheader.msg.data.round
+            )
         };
         // last block has to be received at correct time
         let timestamp = state::timestamp();
         if timestamp > last.sheader.msg.data.timestamp + MAX_CLOCK_GAP + MAX_PROP_TIME {
-            return Err(Error::SmallTimestamp);
+            return Err(msg::chain::Error::SmallTimestamp);
         }
-        println!("BigTimestamp check: it's {:?}, block says {:?}", timestamp, last.sheader.msg.data.timestamp);
         if timestamp + MAX_CLOCK_GAP < last.sheader.msg.data.timestamp {
-            return Err(Error::BigTimestamp);
+            return Err(msg::chain::Error::BigTimestamp);
         }
-        let snaps = {
-            let arr = self.snaps
-                [((first.sheader.msg.data.round - 1) % MAX_FORK) as usize]
-                .lock()
-                .await;
-            let mut prev = arr
-                .get(&first.sheader.msg.data.prev_hash)
-                .ok_or(Error::BadPrev)?;
-            let mut snaps = Vec::default();
-            for block in chain {
-                let verif = block::Verifier::new(prev, block);
-                let snap = verif.finalize().map_err(|(b, e)| Error::BadBlock(b, e))?;
-                snaps.push(snap);
-                prev = snaps.last().unwrap();
-            }
-            snaps
-        };
+        let arr = self.snaps
+            [((first.sheader.msg.data.round - 1) % MAX_FORK) as usize]
+            .lock()
+            .await;
+        let mut prev = arr
+            .get(&first.sheader.msg.data.prev_hash)
+            .ok_or(msg::chain::Error::BadPrev)?;
+        let mut snaps = Vec::default();
+        // serialize
+        let bcast = msg::chain::Broadcast { chain: chain.clone() };
+        let prop = msg::Serialized::new(&bcast);
+        for block in chain {
+            let verif = block::Verifier::new(prev, block);
+            let snap = verif.finalize().map_err(|(b, e)| msg::chain::Error::BadBlock(b, e))?;
+            snaps.push(snap);
+            prev = snaps.last().unwrap();
+        }
         // Now it's good!
         if forked {
             self.txpool.lock().await.clear();
@@ -229,19 +229,36 @@ impl Node {
         for snap in snaps {
             self.add_snap(snap).await;
         }
-        Ok(())
+        if new_head {
+            Ok(Some(prop))
+        } else {
+            Ok(None)
+        }
     }
 
-    pub async fn receive(&self, msg: String) -> Option<String> {
-        match serde_json::from_str(&msg).unwrap() {
-            Message::Blocks(blocks) => {
-                self.receive_chain(blocks)
-                .await
-                .err()
-                .map(|e| serde_json::to_string(&e).unwrap())
+    pub async fn receive_chain(&self, chain: msg::chain::Broadcast) -> 
+        (msg::Serialized<Result<(), msg::chain::Error>>, Option<msg::Serialized<msg::chain::Broadcast>>)
+    {
+        match self.process_chain(chain.chain).await {
+            Ok(opt) => {
+                (msg::Serialized::new(&Ok(())), opt)
             },
-            Message::Txns(txns) => self.receive_txns(txns).await
+            Err(e) => {
+                (msg::Serialized::new(&Err(e)), None)
+            }
         }
+    }
+
+    // for now super dummy impl: just take the snap and make it head!
+    pub async fn receive_resync(&mut self, resync: msg::resync::Response) {
+        for snap in &mut self.snaps {
+            snap.lock().await.clear();
+        }
+        *self.head.lock().await = resync.snap.clone();
+        self.snaps[(resync.snap.block.sheader.msg.data.round % MAX_FORK) as usize]
+            .lock()
+            .await
+            .insert(resync.snap.block_hash, resync.snap);
     }
 }
 
@@ -273,8 +290,8 @@ pub mod tests {
         println!("init gang {:?}", state::timestamp());
         interval.tick().await;
         println!("block0 gang {:?}", state::timestamp());
-        let alice = Node::new(account::Keypair::default(), gen.clone());
-        let bob = Node::new(account::Keypair::gen(), gen.clone());
+        let alice = Node::new(account::Keypair::default(), gen.clone(), state::JENNY_SLOTS);
+        let bob = Node::new(account::Keypair::gen(), gen.clone(), 0);
         alice.tick().await;
         bob.tick().await;
         (interval, alice, bob)
@@ -289,7 +306,13 @@ pub mod tests {
         let bcast = alice.tick().await.expect("Alice should lead");
         assert_eq!(bob.tick().await, None);
         println!("It's {:?}", state::timestamp());
-        assert_eq!(bob.receive(bcast).await, Some(serde_json::to_string(&Error::BigTimestamp).unwrap()));
+        assert_eq!(
+            bob.receive_chain(bcast.deser()).await, 
+            (
+                msg::Serialized::new(&Err(msg::chain::Error::BigTimestamp)),
+                None
+            )
+        );
     }
 
     #[tokio::test]
@@ -299,7 +322,13 @@ pub mod tests {
         sleep(Duration::from_millis(BLOCK_TIME + MAX_CLOCK_GAP + MAX_PROP_TIME + 1_000));
         let bcast = alice.tick().await.expect("Alice should lead");
         assert_eq!(bob.tick().await, None);
-        assert_eq!(bob.receive(bcast).await, Some(serde_json::to_string(&Error::SmallTimestamp).unwrap()));
+        assert_eq!(
+            bob.receive_chain(bcast.deser()).await, 
+            (
+                msg::Serialized::new(&Err(msg::chain::Error::SmallTimestamp)),
+                None
+            )
+        );
     }
 
     #[tokio::test]
@@ -311,33 +340,60 @@ pub mod tests {
         interval.tick().await;
         let bcast = alice.tick().await.expect("Alice should lead");
         assert_eq!(bob.tick().await, None);
-        assert_eq!(bob.receive(bcast).await, Some(serde_json::to_string(&Error::BadPrev).unwrap()));
+        assert_eq!(
+            bob.receive_chain(bcast.deser()).await, 
+            (
+                msg::Serialized::new(&Err(msg::chain::Error::BadPrev)),
+                None
+            )
+        );
     }
 
     #[tokio::test]
     async fn tooshort() {
         let (mut interval, alice, bob) = setup().await;
         let head = { alice.head.lock().await.clone() };
-        let evil_alice = Node::new(account::Keypair::default(), head);
+        let evil_alice = Node::new(account::Keypair::default(), head, 0);
         evil_alice.tick().await;
-        let state = { (evil_alice.head.lock().await).state.clone() };
-        evil_alice.receive(serde_json::to_string(
-            &Message::Txns(Vec::from([alice.kp.send(
-                bob.kp.kp.public, 
-                1, 
-                &state
-            )]))
-        ).unwrap()).await;
+        evil_alice.receive_txns(
+            msg::txn::Broadcast {
+                txns: Vec::from([
+                    alice.kp.send(
+                        bob.kp.kp.public, 
+                        1, 
+                        0
+                    )
+                ])
+            }
+        ).await;
         interval.tick().await;
         let bcast = alice.tick().await.expect("Alice should lead");
         assert_eq!(bob.tick().await, None);
-        assert_eq!(bob.receive(bcast).await, None);
+        assert_eq!(
+            bob.receive_chain(bcast.deser()).await, 
+            (
+                msg::Serialized::new(&Ok(())),
+                None
+            )
+        );
         interval.tick().await;
         let bcast = alice.tick().await.expect("Alice should lead");
         let evil_bcast = evil_alice.tick().await.expect("Alice should lead");
         assert_eq!(bob.tick().await, None);
-        assert_eq!(bob.receive(bcast).await, None);
-        assert_eq!(bob.receive(evil_bcast).await, Some(serde_json::to_string(&Error::TooShort).unwrap()));
+        assert_eq!(
+            bob.receive_chain(bcast.deser()).await, 
+            (
+                msg::Serialized::new(&Ok(())),
+                None
+            )
+        );
+        assert_eq!(
+            bob.receive_chain(evil_bcast.deser()).await, 
+            (
+                msg::Serialized::new(&Err(msg::chain::Error::TooShort)),
+                None
+            )
+        );
     }
 
     #[tokio::test]
@@ -347,38 +403,54 @@ pub mod tests {
         println!("block1 gang {:?}", state::timestamp());
         let bcast = alice.tick().await.expect("Alice should lead");
         assert_eq!(bob.tick().await, None);
-        assert_eq!(bob.receive(bcast).await, None);
+        assert_eq!(
+            bob.receive_chain(bcast.deser()).await, 
+            (
+                msg::Serialized::new(&Ok(())),
+                None
+            )
+        );
         interval.tick().await;
         println!("second");
         let bcast = alice.tick().await.expect("Alice should lead");
         assert_eq!(bob.tick().await, None);
-        assert_eq!(bob.receive(bcast).await, None);
+        assert_eq!(
+            bob.receive_chain(bcast.deser()).await, 
+            (
+                msg::Serialized::new(&Ok(())),
+                None
+            )
+        );
         let mut txns = Vec::default();
         let state = { alice.head.lock().await.state.clone() };
         txns.push(
             alice.kp.send(
                 bob.kp.kp.public, 
                 state.accounts.get(&Sha256::digest(alice.kp.kp.public.to_bytes())).unwrap().unwrap().bal,
-                &state
+                state::JENNY_SLOTS
             )
         );
-        alice.receive(
-            serde_json::to_string(
-                &Message::Txns(txns)
-            ).unwrap()
+        alice.receive_txns(
+            msg::txn::Broadcast { txns }
         ).await;
         interval.tick().await;
         println!("third");
         let bcast = alice.tick().await.expect("Alice should lead");
         assert_eq!(bob.tick().await, None);
-        assert_eq!(bob.receive(bcast).await, None);
+        assert_eq!(
+            bob.receive_chain(bcast.deser()).await, 
+            (
+                msg::Serialized::new(&Ok(())),
+                None
+            )
+        );
         let (mut state, meta) = {
             let head = bob.head.lock().await;
             (head.state.clone(), head.block.sheader.msg.data.clone())
         };
         let mut txns = Vec::default();
-        for _ in 0..state::VALIDATOR_SLOTS >> 1 {
-            let stake = bob.kp.stake(&state);
+        for i in 0..state::VALIDATOR_SLOTS >> 1 {
+            let stake = bob.kp.stake(&state, i);
             txns.push(stake.clone());
             assert!(
                 state.apply(
@@ -387,16 +459,20 @@ pub mod tests {
                 ).is_ok()
             );
         }
-        alice.receive(
-            serde_json::to_string(
-                &Message::Txns(txns)
-            ).unwrap()
+        alice.receive_txns(
+            msg::txn::Broadcast { txns }
         ).await;
         interval.tick().await;
         println!("fourth");
         let bcast = alice.tick().await.expect("Alice should lead");
         assert_eq!(bob.tick().await, None);
-        assert_eq!(bob.receive(bcast).await, None);
+        assert_eq!(
+            bob.receive_chain(bcast.deser()).await, 
+            (
+                msg::Serialized::new(&Ok(())),
+                None
+            )
+        );
         // Now they should lead evenly.
         let mut alice_ctr = 0;
         for _ in 0..25 {
@@ -407,12 +483,24 @@ pub mod tests {
                     println!("alice gang");
                     alice_ctr += 1;
                     assert_eq!(bob.tick().await, None);
-                    assert_eq!(bob.receive(bcast).await, None);
+                    assert_eq!(
+                        bob.receive_chain(bcast.deser()).await, 
+                        (
+                            msg::Serialized::new(&Ok(())),
+                            None
+                        )
+                    );
                 },
                 None => {
                     println!("bob gang");
                     let bcast = bob.tick().await.expect("Bob should lead");
-                    assert_eq!(alice.receive(bcast).await, None);
+                    assert_eq!(
+                        alice.receive_chain(bcast.deser()).await, 
+                        (
+                            msg::Serialized::new(&Ok(())),
+                            None
+                        )
+                    );
                 }
             }
         }

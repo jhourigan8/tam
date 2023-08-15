@@ -29,9 +29,9 @@ pub fn map(crit: &mut Criterion) {
     }));
 
     let (alice, snap) = <(account::Keypair, block::Snap)>::default();
-    let mut builder = block::Builder::new(&alice, 1, &snap);
+    let builder = block::Builder::new(&alice, 1, &snap);
     let bob = account::Keypair::gen();
     crit.bench_function("state payment", |b| b.iter(|| {
-        assert!(builder.add(alice.send(bob.kp.public, 1, &builder.state)).is_ok());
+        assert!(builder.clone().add(alice.send(bob.kp.public, 1, state::JENNY_SLOTS)).is_ok());
     }));
 }

@@ -1,5 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Deserialize;
+use serde::Serialize;
 use sha2::{Sha256, Digest};
 use crate::merkle;
 use crate::account;
@@ -10,11 +12,13 @@ use crate::block;
 pub const VALIDATOR_ROOT: account::Account = [0u8; 32];
 pub const VALIDATOR_SLOTS: u32 = 256;
 pub const VALIDATOR_STAKE: u32 = 1024;
+pub const JENNY_COINS: u32 = VALIDATOR_SLOTS * VALIDATOR_STAKE >> 1;
+pub const JENNY_SLOTS: u32 = VALIDATOR_SLOTS >> 1;
 pub const NUM_SHARDS: u8 = 1;
 
 const _MAX_FORK: u32 = 128;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub accounts: merkle::Map<account::Data>,
     pub validators: merkle::Map<validator::Data>,
@@ -31,7 +35,7 @@ impl Default for State {
             state.accounts.insert(
                 &Sha256::digest(jenny_acc.kp.public.to_bytes()),
                 account::Data { 
-                    bal: VALIDATOR_SLOTS * VALIDATOR_STAKE, 
+                    bal: JENNY_COINS + JENNY_SLOTS * VALIDATOR_STAKE, 
                     nonce: 0 
                 }
             ).is_ok()
@@ -44,10 +48,10 @@ impl Default for State {
             seed: [0u8; 32],
             beacon: jenny_acc.sign(&[0u8; 32])
         };
-        for _ in 0..VALIDATOR_SLOTS >> 1 {
+        for i in 0..VALIDATOR_SLOTS >> 1 {
             assert!(
                 state.apply(
-                    &jenny_acc.stake(&state), 
+                    &jenny_acc.stake(&state, i), 
                     &meta
                 ).is_ok()
             );
@@ -205,31 +209,31 @@ pub mod tests {
         let charlie = account::Keypair::gen();
         assert!(
             builder.add(
-                alice.send(bob.kp.public, 1 << 15, &builder.state)
+                alice.send(bob.kp.public, 1 << 15, JENNY_SLOTS)
             )
             .is_ok()
         );
         assert!(
             builder.add(
-                alice.send(charlie.kp.public, 1 << 5, &builder.state)
+                alice.send(charlie.kp.public, 1 << 5, JENNY_SLOTS + 1)
             )
             .is_ok()
         );
         assert!(
             builder.add(
-                bob.send(charlie.kp.public, 1 << 1, &builder.state)
+                bob.send(charlie.kp.public, 1 << 1, 0)
             )
             .is_ok()
         );
         assert!(
             builder.add(
-                charlie.send(bob.kp.public, (1 << 5) + (1 << 1), &builder.state)
+                charlie.send(bob.kp.public, (1 << 5) + (1 << 1), 0)
             )
             .is_ok()
         );
         assert!(
             builder.add(
-                alice.send(bob.kp.public, 1 << 8, &builder.state)
+                alice.send(bob.kp.public, 1 << 8, JENNY_SLOTS + 2)
             )
             .is_ok()
         );
@@ -355,7 +359,7 @@ pub mod tests {
         let mut data = BTreeMap::default();
         data.insert(
             String::from("idx"), 
-            alice.unstake(&builder.state).msg.data.get("idx").unwrap().clone()
+            alice.unstake(&builder.state, JENNY_SLOTS).msg.data.get("idx").unwrap().clone()
         );
         data.insert(
             String::from("method"), 
@@ -378,7 +382,7 @@ pub mod tests {
         let mut data = BTreeMap::default();
         data.insert(
             String::from("idx"), 
-            alice.stake(&builder.state).msg.data.get("idx").unwrap().clone()
+            alice.stake(&builder.state, JENNY_SLOTS).msg.data.get("idx").unwrap().clone()
         );
         data.insert(
             String::from("method"), 
@@ -407,7 +411,7 @@ pub mod tests {
         let mut data = BTreeMap::default();
         data.insert(
             String::from("idx"), 
-            alice.stake(&builder.state).msg.data.get("idx").unwrap().clone()
+            alice.stake(&builder.state, JENNY_SLOTS).msg.data.get("idx").unwrap().clone()
         );
         let msg = txn::Txn {
             to: VALIDATOR_ROOT,
@@ -428,7 +432,7 @@ pub mod tests {
         let mut data = BTreeMap::default();
         data.insert(
             String::from("idx"), 
-            alice.stake(&builder.state).msg.data.get("idx").unwrap().clone()
+            alice.stake(&builder.state, JENNY_SLOTS).msg.data.get("idx").unwrap().clone()
         );
         data.insert(
             String::from("method"), 
@@ -456,7 +460,7 @@ pub mod tests {
         let mut builder = block::Builder::new(&alice, 1, &snap);
         let bob = account::Keypair::gen();
         assert_eq!(
-            builder.add(alice.send(bob.kp.public, 1 << 20, &builder.state)).map_err(|e| e.1), 
+            builder.add(alice.send(bob.kp.public, JENNY_COINS + 1, JENNY_SLOTS)).map_err(|e| e.1), 
             Err(txn::Error::InsuffBal)
         );
     }
@@ -468,7 +472,7 @@ pub mod tests {
         let mut data = BTreeMap::default();
         data.insert(
             String::from("idx"), 
-            alice.stake( &builder.state).msg.data.get("idx").unwrap().clone()
+            alice.stake(&builder.state, JENNY_SLOTS).msg.data.get("idx").unwrap().clone()
         );
         data.insert(
             String::from("method"), 
@@ -477,7 +481,7 @@ pub mod tests {
         let msg = txn::Txn {
             to: VALIDATOR_ROOT,
             amount: VALIDATOR_STAKE - 1,
-            nonce: VALIDATOR_SLOTS >> 1,
+            nonce: JENNY_SLOTS,
             data
         };
         assert_eq!(
@@ -495,12 +499,11 @@ pub mod tests {
         let (alice, snap) = <(account::Keypair, block::Snap)>::default();
         let mut builder = block::Builder::new(&alice, 1, &snap);
         let bob = account::Keypair::gen();
-        let old = builder.clone();
         assert!(
-            builder.add(alice.send(bob.kp.public, 1, &builder.state)).is_ok()
+            builder.add(alice.send(bob.kp.public, 1, JENNY_SLOTS)).is_ok()
         );
         assert_eq!(
-            builder.add(alice.send(bob.kp.public, 1, &old.state)).map_err(|e| e.1), 
+            builder.add(alice.send(bob.kp.public, 1, JENNY_SLOTS)).map_err(|e| e.1), 
             Err(txn::Error::SmallNonce)
         );
     }
@@ -512,10 +515,10 @@ pub mod tests {
         let bob = account::Keypair::gen();
         let mut old = builder.clone();
         assert!(
-            builder.add(alice.send(bob.kp.public, 1, &builder.state)).is_ok()
+            builder.add(alice.send(bob.kp.public, 1, JENNY_SLOTS)).is_ok()
         );
         assert_eq!(
-            old.add(alice.send(bob.kp.public, 1, &builder.state)).map_err(|e| e.1), 
+            old.add(alice.send(bob.kp.public, 1, JENNY_SLOTS + 1)).map_err(|e| e.1), 
             Err(txn::Error::BigNonce)
         );
     }

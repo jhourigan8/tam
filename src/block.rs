@@ -125,7 +125,7 @@ pub enum Error {
     NotLeader,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snap {
     pub block: Block,
     pub block_hash: [u8; 32],
@@ -331,7 +331,7 @@ pub mod tests {
             let txn = txn::Txn {
                 to: bob.kp.public.to_bytes(),
                 amount: 1, 
-                nonce: i + (state::VALIDATOR_SLOTS >> 1),
+                nonce: i + state::JENNY_SLOTS,
                 data: BTreeMap::default()
             };
             let sig = alice.sign(&txn);
@@ -455,7 +455,7 @@ pub mod tests {
         let bad = alice.send(
             bob.kp.public, 
             state::VALIDATOR_STAKE * state::VALIDATOR_SLOTS, 
-            &builder.state
+            state::JENNY_SLOTS + 128
         );
         assert_eq!(builder.txnseq.insert(&[0u8], bad.clone()), Ok(None));
         let block = builder.finalize(&alice).block;

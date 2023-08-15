@@ -35,7 +35,7 @@ pub struct Data {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Keypair {
-    pub kp: ed25519_dalek::Keypair
+    pub kp: ed25519_dalek::Keypair,
 }
 
 impl Keypair {
@@ -48,11 +48,15 @@ impl Keypair {
         self.kp.sign(&serde_json::to_string(&msg).expect("").as_bytes())
     }
 
-    pub fn send(&self, to: PublicKey, amount: u32, state: &State) -> Signed<Txn> {
+    pub fn send(&self, to: PublicKey, amount: u32, nonce: u32) -> Signed<Txn> {
+        self.send_acc(Sha256::digest(to).into(), amount, nonce)
+    }
+
+    pub fn send_acc(&self, to: [u8; 32], amount: u32, nonce: u32) -> Signed<Txn> {
         let msg = Txn {
-            to: Sha256::digest(to).into(),
+            to,
             amount,
-            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().unwrap().nonce,
+            nonce,
             data: BTreeMap::default()
         };
         let sig = self.sign(&msg);
@@ -63,7 +67,7 @@ impl Keypair {
         }
     }
 
-    pub fn stake(&self, state: &State) -> Signed<Txn> {
+    pub fn stake(&self, state: &State, nonce: u32) -> Signed<Txn> {
         let mut rng = rand::thread_rng();
         let idx = loop {
             let rand = rng.gen::<u32>() % VALIDATOR_SLOTS;
@@ -77,7 +81,7 @@ impl Keypair {
         let msg = Txn {
             to: VALIDATOR_ROOT,
             amount: VALIDATOR_STAKE,
-            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().unwrap().nonce,
+            nonce,
             data
         };
         let sig = self.sign(&msg);
@@ -88,7 +92,7 @@ impl Keypair {
         }
     }
 
-    pub fn unstake(&self, state: &State) -> Signed<Txn> {
+    pub fn unstake(&self, state: &State, nonce: u32) -> Signed<Txn> {
         let mut rng = rand::thread_rng();
         let idx = loop {
             let rand = rng.gen::<u32>() % VALIDATOR_SLOTS;
@@ -104,7 +108,7 @@ impl Keypair {
         let msg = Txn {
             to: VALIDATOR_ROOT,
             amount: 0,
-            nonce: state.accounts.get(&Sha256::digest(self.kp.public.to_bytes())).unwrap().unwrap().nonce,
+            nonce,
             data
         };
         let sig = self.sign(&msg);

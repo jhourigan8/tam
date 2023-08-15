@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <script src="https://unpkg.com/htmx.org@1.9.2"></script>
+        <script src="https://unpkg.com/htmx.org/dist/ext/json-enc.js"></script>
+    
+        <!-- Allow any inheriting page to extend head with additional assets -->
+        {% block head %}{% endblock %}
+      </head>
+<body>
+<h1>Explorer</h1>
+<p>Lookup accounts and validator slots</p>
+<form>
+    <label for="address">64 digit address in hex:</label><br>
+    <input name="address" id="address" style="width: 510px;" list="search_response"
+        hx-get="/api/account_search" 
+        hx-trigger="keyup changed delay:500ms, search" 
+        hx-target="#search_response"
+        hx-swap="outerHTML"><br>
+    <datalist id="search_response">
+    </datalist>
+    <button hx-get="/api/account" hx-include="#address" hx-target="#account_response" hx-swap="outerHTML">
+        Submit
+    </button>
+    <p id="account_response">
+        
+    </p>
+</form>
+<form>
+    <label for="slot">Validator slot from 0 to {{ max_slot }} in decimal:</label><br>
+    <input name="slot" id="slot" style="width: 100px;"><br>
+    <button hx-get="/api/validator" hx-include="#slot" hx-target="#validator_response" hx-swap="outerHTML">
+        Submit
+    </button>
+    <p id="validator_response">
+    </p>
+</form>
+</body>
+</html>

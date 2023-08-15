@@ -6,14 +6,17 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+askama = "0.12.0"
 axum = "0.6.20"
 bls-signatures = "0.14.0"
 blst = "0.3.10"
-criterion = "0.5.1"
+chrono = "0.4.26"
+criterion = { version = "0.5.1", features = ["async", "async_tokio"] }
 digest = "0.10.6"
 ed25519-dalek = { version = "1.0.1", features = ["serde"] }
 either = "1.8.1"
 ethnum = { version = "1.3.2", features = ["serde"] }
+minijinja = { version = "1.0.5", features = ["loader"] }
 names = "0.14.0"
 nibble_vec = "0.1.0"
 once_cell = "1.18.0"
@@ -25,7 +28,10 @@ serde-big-array = "0.5.1"
 serde_json = "1.0.96"
 sha2 = "0.10.6"
 smallvec = "1.10.0"
-tokio = { version = "1.29.1", features = ["time", "macros", "rt"] }
+tokio = { version = "1.29.1", features = ["time", "macros", "rt", "rt-multi-thread"] }
+tower = "0.4.13"
+tower-http = { version = "0.4.3", features = ["fs"] }
+ux = "0.1.5"
 
 [[bench]]
 name = "benches"

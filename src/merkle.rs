@@ -267,6 +267,73 @@ impl<T: Serialize + Clone> Node<T> {
         MerkleIterator { stack: Vec::from([(self, false)]) }
     }
 
+    fn entry_iter<'a>(&'a self) -> MerkleEntryIterator<'a, T> {
+        MerkleEntryIterator { stack: Vec::from([(self, false, self.node.as_ref().unwrap().substr.clone())]) }
+    }
+
+    // Get subtrie matching k. Plus the path from root to it.
+    fn get_subtrie(&self, k: &[u8]) -> Result<Option<(&Self, Vec<u8>)>, ()> {
+        let node = self.node.as_ref().ok_or(())?;
+        let cut_at = Self::prefix_len(k, &node.substr);
+        if node.substr.len() > cut_at {
+            if k.len() > cut_at {
+                // Key forks from substr
+                Ok(None)
+            } else {
+                // Key contained in `substr`
+                Ok(Some((&self, Vec::default())))
+            }
+        } else {
+            if k.len() > cut_at {
+                // Key continues after `substr`
+                if let Some(ref children) = &node.children {
+                    if let Some(ref child) = children[k[cut_at] as usize] {
+                        let path = Vec::from(&k[0..cut_at+1]);
+                        child.get_subtrie_rec(&k[cut_at + 1..], path)
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            } else {
+                // Key is `substr`
+                Ok(Some((&self, Vec::default())))
+            }
+        }
+    }
+
+    fn get_subtrie_rec(&self, k: &[u8], mut path: Vec<u8>) -> Result<Option<(&Self, Vec<u8>)>, ()> {
+        let node = self.node.as_ref().ok_or(())?;
+        let cut_at = Self::prefix_len(k, &node.substr);
+        if node.substr.len() > cut_at {
+            if k.len() > cut_at {
+                // Key forks from substr
+                Ok(None)
+            } else {
+                // Key contained in `substr`
+                Ok(Some((&self, path)))
+            }
+        } else {
+            if k.len() > cut_at {
+                // Key continues after `substr`
+                if let Some(ref children) = &node.children {
+                    if let Some(ref child) = children[k[cut_at] as usize] {
+                        path.extend(&k[0..cut_at+1]);
+                        child.get_subtrie_rec(&k[cut_at + 1..], path)
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            } else {
+                // Key is `substr`
+                Ok(Some((&self, path)))
+            }
+        }
+    }
+
     /*
     // Get subtrie only containing data at ks
     // If true, include its entire subtree, else don't
@@ -278,10 +345,10 @@ impl<T: Serialize + Clone> Node<T> {
         let mut clone = self.clone();
         for (k, kids) in ks {
             let cut_at = Self::prefix_len(k, &self.node.as_ref().unwrap().substr);
-            if k.len() == cut_at {
+            if k.len() < cut_at || k.len() == cut_at {
                 include_self = true;
                 include_kids |= kids;
-            } else if k.len() > cut_at {
+            } else {
                 recs[k[cut_at] as usize].push((&k[cut_at + 1..], kids));
             }
         }
@@ -400,6 +467,53 @@ impl<'a, T> Iterator for MerkleIterator<'a, T> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MerkleEntryIterator<'a, T> {
+    stack: Vec<(&'a Node<T>, bool, Vec<u8>)> // lazy impl -> log cost but whatever
+}
+
+impl<'a, T> MerkleEntryIterator<'a, T> {
+    // Push stuff until last vec entry has no children.
+    fn advance(&mut self) {
+        while let Some((merk, ref explored, path)) = self.stack.pop() {
+            self.stack.push((merk, true, path.clone()));
+            if *explored { return; }
+            if let Some(ref children) = merk.node.as_ref().unwrap().children {
+                for (i, opt_child) in children.iter().enumerate().rev() {
+                    if let Some(child) = opt_child {
+                        let mut child_path = path.clone();
+                        child_path.push(i as u8);
+                        child_path.extend(&child.node.as_ref().unwrap().substr);
+                        println!("i pushed {:?}", child_path);
+                        self.stack.push((&child, false, child_path));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<'a, T> Iterator for MerkleEntryIterator<'a, T> {
+    type Item = (Vec<u8>, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut val = None;
+        while val.is_none() {
+            self.advance();
+            val = match self.stack.pop() {
+                Some((ref merk, _, path)) => {
+                    match merk.node {
+                        Some(ref node) => node.value.as_ref().map(|v| (path, v)),
+                        None => continue,
+                    }
+                },
+                None => return None,
+            }
+        }
+        val
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Map<V> {
     root: Node<V>
@@ -439,8 +553,21 @@ impl<V: Serialize + Clone> Map<V> {
         self.root.get(&Self::to_digest(k))
     }
 
-    pub fn iter<'a>(&'a self) -> MerkleIterator<'a, V> {
+    // for only this one the input is already digested.
+    // TODO: all inputs to all fns should be pre digested!
+    pub fn get_subtrie(&self, k: &[u8]) -> Result<Option<(Self, Vec<u8>)>, ()> {
+        match self.root.get_subtrie(&k)? {
+            None => Ok(None),
+            Some((r, p)) => Ok(Some((Self { root: r.clone() }, p)))
+        }
+    }
+
+    pub fn iter(&self) -> MerkleIterator<V> {
         self.root.iter()
+    }
+
+    pub fn entry_iter(&self) -> MerkleEntryIterator<V> {
+        self.root.entry_iter()
     }
 
     pub fn commit(&self) -> [u8; 32] {

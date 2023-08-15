@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <script src="https://unpkg.com/htmx.org@1.9.2"></script>
+        <script src="https://unpkg.com/htmx.org/dist/ext/json-enc.js"></script>
+    
+        <!-- Allow any inheriting page to extend head with additional assets -->
+        {% block head %}{% endblock %}
+      </head>
+<body>
+<h1>Faucet</h1>
+<img src='https://cloudfront-us-east-1.images.arcpublishing.com/bostonglobe/5E633NDLKJVC5QMXYUS63K65ME.jpg' alt='Joe' width="500" height="300">
+<p>Hey there jack! Need some cash? Enter your address jack</p>
+<form>
+    <label for="address">64 digit address in hex:</label><br>
+    <input name="address" id="address" style="width: 510px;" list="search_response"
+        hx-get="/api/account_search" 
+        hx-trigger="keyup changed delay:500ms, search" 
+        hx-target="#search_response"
+        hx-swap="outerHTML"><br>
+    <datalist id="search_response">
+    </datalist>
+    <label for="amount">Amount of coins requested:</label><br>
+    <input name="amount" id="amount" style="width: 50px;"><br>
+    <button hx-post="/api/faucet" hx-ext="json-enc" hx-target="#response" hx-swap="outerHTML">
+        Submit
+    </button>
+    <p id="response">
+        
+    </p>
+</form>
+</body>
+</html>
