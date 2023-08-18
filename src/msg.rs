@@ -1,89 +1,101 @@
-use std::marker::PhantomData;
 use serde::{Serialize, Deserialize};
+use crate::{block, state, txn, account, app, merkle};
 
-#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-pub struct Serialized<T> {
-    pub str: String,
-    _phantom: PhantomData<T>
+// Clients send a Message::X and recieve Result<ok::X, error::X>
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum Message {
+    Txn(Vec<account::Signed<txn::Txn>>),
+    Chain(Vec<block::Block>),
+    Resync(),
+    Batch([u8; 32], u32)
 }
 
-impl<'a, T: Serialize + Deserialize<'a>> Serialized<T> {
-    pub fn new(x: &T) -> Self {
-        let str = serde_json::to_string(x).expect("can't serialize value");
-        Self { str, _phantom: PhantomData::default() }
+impl Message {
+    pub fn txn(self) -> Option<Vec<account::Signed<txn::Txn>>> {
+        if let Message::Txn(vec) = self {
+            Some(vec)
+        } else {
+            None
+        }
     }
 
-    pub fn deser(self) -> T {
-        serde_json::from_str(&self.str).unwrap()
+    pub fn chain(self) -> Option<Vec<block::Block>> {
+        if let Message::Chain(vec) = self {
+            Some(vec)
+        } else {
+            None
+        }
+    }
+
+    pub fn resync(self) -> Option<()> {
+        if let Message::Resync() = self {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    pub fn batch(self) -> Option<([u8; 32], u32)> {
+        if let Message::Batch(block_hash, batch) = self {
+            Some((block_hash, batch))
+        } else {
+            None
+        }
     }
 }
 
-pub mod txn {
+pub mod ok {
     use super::*;
 
-    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-    pub struct Broadcast {
-        pub txns: Vec<crate::account::Signed<crate::txn::Txn>>
-    }
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct Txn {}
 
-    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-    pub enum Error {
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct Chain {}
 
-    }
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct Resync { snap: block::Snap }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct Batch { batch: merkle::Map<account::Signed<txn::Txn>> }
 }
 
-pub mod chain {
+pub mod error {
     use super::*;
 
-    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-    pub struct Broadcast {
-        pub chain: Vec<crate::block::Block>
-    }
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub enum Txn {}
 
-    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-    pub enum Error {
-        BadBlock(crate::block::Block, crate::block::Error),
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub enum Chain {
+        BadBlock(block::Block, block::Error),
         BigTimestamp,
         SmallTimestamp,
         BadPrev,
         TooShort,
         AlreadyHave
     }
-}
 
-pub mod resync {
-    use super::*;
-
-    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-    pub struct Request { }
-
-    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-    pub struct Response {
-        pub snap: crate::block::Snap
-    }
-
-    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-    pub enum Error {
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub enum Resync {
         NotSaved
     }
-}
 
-pub mod batch {
-    use super::*;
-
-    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-    pub struct Request {
-        pub block_hash: [u8; 32],
-        pub batch: u32
-    }
-
-    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-    pub struct Response {
-        pub batch: crate::merkle::Map<crate::account::Signed<crate::txn::Txn>>
-    }
-
-    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-    pub enum Error {
-        TooBig
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub enum Batch {
+        DoesntExist
     }
 }
+
+pub fn ser<T: Serialize>(x: &T) -> String {
+    serde_json::to_string(x).unwrap()
+}
+
+pub fn deser<'a, T: Deserialize<'a>>(s: &'a str) -> T {
+    println!("{}", s);
+    serde_json::from_str(s).unwrap()
+}
+
+pub type Response = String;
+pub type Bcasts = Vec<String>;

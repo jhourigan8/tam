@@ -53,7 +53,7 @@ impl Node {
     // timestamp tick!
     // may return block to prop
     // time can be a little bit after exact tick moment
-    pub async fn tick(&self) -> Option<msg::Serialized<msg::chain::Broadcast>> {
+    pub async fn tick(&self) -> msg::Bcasts {
         let mut empty_builder = None;
         {
             let mut opt_builder = self.opt_builder.lock().await;
@@ -62,12 +62,14 @@ impl Node {
         let ret = match empty_builder {
             Some(builder) => {
                 let snap = builder.finalize(&self.kp);
-                let req = msg::chain::Broadcast { chain: Vec::from([snap.block.clone()]) };
-                let prop = msg::Serialized::new(&req);
+                let msg = msg::Message::Chain(
+                    Vec::from([snap.block.clone()])
+                );
+                let msg = msg::ser(&msg);
                 self.add_snap(snap).await;
-                Some(prop)
+                Vec::from([msg])
             },
-            None => None
+            None => Vec::default()
         };
         self.check_leader().await;
         ret
@@ -126,10 +128,9 @@ impl Node {
         arr.insert(snap.block.sheader.msg.hash(), snap);
     }
 
-    pub async fn receive_txns(&self, txns: msg::txn::Broadcast) -> 
-        (msg::Serialized<Result<(), msg::txn::Error>>, Option<msg::Serialized<msg::txn::Broadcast>>)
+    pub async fn receive_txns(&self, txns: Vec<account::Signed<txn::Txn>>) -> 
+        (msg::Response, msg::Bcasts)
     {
-        let txns = txns.txns;
         let head = self.head.lock().await;
         let meta = block::Metadata::new(&self.kp, 1, &head);
         let mut valid = Vec::default();
@@ -137,8 +138,10 @@ impl Node {
         // Keep txns which pass or have big nonce (TODO: need to flush txpool...)
         match *self.opt_builder.lock().await {
             Some(ref mut builder) => {
+                println!("I AM BUILDING!");
                 for txn in txns {
                     if let Err((txn, err)) = builder.add(txn.clone()) {
+                        println!("bad txn");
                         if err == txn::Error::BigNonce {
                             if !(*txpool).contains(&txn) {
                                 if head.state.verify(&txn, &meta).is_ok() {
@@ -150,6 +153,7 @@ impl Node {
                 }
             },
             None => {
+                println!("I AM NOT BUILDING!");
                 for txn in txns {
                     if !(*txpool).contains(&txn) {
                         match head.state.verify(&txn, &meta) {
@@ -160,37 +164,38 @@ impl Node {
                 }
             }
         }
-        let resp = msg::Serialized::new(&Ok::<(), msg::txn::Error>(()));
+        let result: Result<msg::ok::Txn, msg::error::Txn> = Ok(msg::ok::Txn {});
+        let resp = msg::ser(&result);
         if valid.is_empty() {
-            (resp, None)
+            (resp, Vec::default())
         } else {
-            let req = msg::txn::Broadcast { txns: valid };
-            let prop = msg::Serialized::new(&req);
-            for txn in req.txns {
+            let msg = msg::Message::Txn(valid);
+            let ser = msg::ser(&msg);
+            for txn in msg.txn().unwrap() {
                 (*txpool).insert(txn);
             }
-            (resp, Some(prop))
+            (resp, Vec::from([ser]))
         }
     }
 
     async fn process_chain(&self, mut chain: Vec<block::Block>) -> 
-        Result<Option<msg::Serialized<msg::chain::Broadcast>>, msg::chain::Error> 
+        Result<msg::Bcasts, msg::error::Chain> 
     {
         // Drop anything that isn't new.
-        let mut first = chain.get(0).ok_or(msg::chain::Error::AlreadyHave)?;
+        let mut first = chain.get(0).ok_or(msg::error::Chain::AlreadyHave)?;
         while self.snaps[(first.sheader.msg.data.round % MAX_FORK) as usize]
             .lock()
             .await
             .contains_key(&first.sheader.msg.hash()) {
                 chain.remove(0);
-                first = chain.get(0).ok_or(msg::chain::Error::AlreadyHave)?;
+                first = chain.get(0).ok_or(msg::error::Chain::AlreadyHave)?;
         }
         let last = chain.last().unwrap();
         let (forked, new_head) = {
             let head = self.head.lock().await;
             // println!("received {:#?} and head is {:#?}", first.sheader.msg, head.block.sheader.msg);
             if last.sheader.msg.data.round <= head.block.sheader.msg.data.round {
-                return Err(msg::chain::Error::TooShort);
+                return Err(msg::error::Chain::TooShort);
             }
             (
                 first.sheader.msg.data.prev_hash != head.block_hash, 
@@ -200,10 +205,10 @@ impl Node {
         // last block has to be received at correct time
         let timestamp = state::timestamp();
         if timestamp > last.sheader.msg.data.timestamp + MAX_CLOCK_GAP + MAX_PROP_TIME {
-            return Err(msg::chain::Error::SmallTimestamp);
+            return Err(msg::error::Chain::SmallTimestamp);
         }
         if timestamp + MAX_CLOCK_GAP < last.sheader.msg.data.timestamp {
-            return Err(msg::chain::Error::BigTimestamp);
+            return Err(msg::error::Chain::BigTimestamp);
         }
         let arr = self.snaps
             [((first.sheader.msg.data.round - 1) % MAX_FORK) as usize]
@@ -211,14 +216,14 @@ impl Node {
             .await;
         let mut prev = arr
             .get(&first.sheader.msg.data.prev_hash)
-            .ok_or(msg::chain::Error::BadPrev)?;
+            .ok_or(msg::error::Chain::BadPrev)?;
         let mut snaps = Vec::default();
         // serialize
-        let bcast = msg::chain::Broadcast { chain: chain.clone() };
-        let prop = msg::Serialized::new(&bcast);
+        let msg = msg::Message::Chain(chain.clone());
+        let ser = msg::ser(&msg);
         for block in chain {
             let verif = block::Verifier::new(prev, block);
-            let snap = verif.finalize().map_err(|(b, e)| msg::chain::Error::BadBlock(b, e))?;
+            let snap = verif.finalize().map_err(|(b, e)| msg::error::Chain::BadBlock(b, e))?;
             snaps.push(snap);
             prev = snaps.last().unwrap();
         }
@@ -230,35 +235,44 @@ impl Node {
             self.add_snap(snap).await;
         }
         if new_head {
-            Ok(Some(prop))
+            Ok(Vec::from([ser]))
         } else {
-            Ok(None)
+            Ok(Vec::default())
         }
     }
 
-    pub async fn receive_chain(&self, chain: msg::chain::Broadcast) -> 
-        (msg::Serialized<Result<(), msg::chain::Error>>, Option<msg::Serialized<msg::chain::Broadcast>>)
+    pub async fn receive_chain(&self, chain: Vec<block::Block>) -> 
+        (msg::Response, msg::Bcasts)
     {
-        match self.process_chain(chain.chain).await {
+        match self.process_chain(chain).await {
             Ok(opt) => {
-                (msg::Serialized::new(&Ok(())), opt)
+                (msg::ser(&Ok::<_, msg::error::Txn>(msg::ok::Txn {})), opt)
             },
             Err(e) => {
-                (msg::Serialized::new(&Err(e)), None)
+                (msg::ser(&Err::<msg::ok::Txn, _>(e)), Vec::default())
             }
         }
     }
 
     // for now super dummy impl: just take the snap and make it head!
-    pub async fn receive_resync(&mut self, resync: msg::resync::Response) {
+    pub async fn accept_resync(&mut self, snap: block::Snap) {
         for snap in &mut self.snaps {
             snap.lock().await.clear();
         }
-        *self.head.lock().await = resync.snap.clone();
-        self.snaps[(resync.snap.block.sheader.msg.data.round % MAX_FORK) as usize]
+        *self.head.lock().await = snap.clone();
+        self.snaps[(snap.block.sheader.msg.data.round % MAX_FORK) as usize]
             .lock()
             .await
-            .insert(resync.snap.block_hash, resync.snap);
+            .insert(snap.block_hash, snap);
+    }
+
+    pub async fn receive(&self, msg: msg::Message) -> (msg::Response, msg::Bcasts) {
+        match msg {
+            msg::Message::Txn(txns) => self.receive_txns(txns).await,
+            msg::Message::Chain(chain) => self.receive_chain(chain).await,
+            msg::Message::Resync() => todo!(),
+            msg::Message::Batch(block_hash, batch) => todo!()
+        }
     }
 }
 
@@ -303,14 +317,13 @@ pub mod tests {
         println!("It's {:?}", state::timestamp());
         // Don't wait long enough.
         sleep(Duration::from_millis((block::BLOCK_TIME - MAX_CLOCK_GAP) >> 1));
-        let bcast = alice.tick().await.expect("Alice should lead");
-        assert_eq!(bob.tick().await, None);
-        println!("It's {:?}", state::timestamp());
+        let bcast: msg::Message = msg::deser(&alice.tick().await.pop().expect("Alice should lead"));
+        assert_eq!(bob.tick().await, msg::Bcasts::default());
         assert_eq!(
-            bob.receive_chain(bcast.deser()).await, 
+            bob.receive(bcast).await, 
             (
-                msg::Serialized::new(&Err(msg::chain::Error::BigTimestamp)),
-                None
+                msg::ser(&Err::<msg::ok::Chain,_>(msg::error::Chain::BigTimestamp)),
+                msg::Bcasts::default()
             )
         );
     }
@@ -320,13 +333,13 @@ pub mod tests {
         let (_, alice, bob) = setup().await;
         // Wait too long.
         sleep(Duration::from_millis(BLOCK_TIME + MAX_CLOCK_GAP + MAX_PROP_TIME + 1_000));
-        let bcast = alice.tick().await.expect("Alice should lead");
-        assert_eq!(bob.tick().await, None);
+        let bcast: msg::Message = msg::deser(&alice.tick().await.pop().expect("Alice should lead"));
+        assert_eq!(bob.tick().await, msg::Bcasts::default());
         assert_eq!(
-            bob.receive_chain(bcast.deser()).await, 
+            bob.receive(bcast).await, 
             (
-                msg::Serialized::new(&Err(msg::chain::Error::SmallTimestamp)),
-                None
+                msg::ser(&Err::<msg::ok::Chain,_>(msg::error::Chain::SmallTimestamp)),
+                msg::Bcasts::default()
             )
         );
     }
@@ -335,16 +348,16 @@ pub mod tests {
     async fn badprev() {
         let (mut interval, alice, bob) = setup().await;
         interval.tick().await;
-        let _ = alice.tick().await.expect("Alice should lead");
-        assert_eq!(bob.tick().await, None);
+        alice.tick().await.pop().expect("Alice should lead");
+        assert_eq!(bob.tick().await, msg::Bcasts::default());
         interval.tick().await;
-        let bcast = alice.tick().await.expect("Alice should lead");
-        assert_eq!(bob.tick().await, None);
+        let bcast = msg::deser(&alice.tick().await.pop().expect("Alice should lead"));
+        assert_eq!(bob.tick().await, msg::Bcasts::default());
         assert_eq!(
-            bob.receive_chain(bcast.deser()).await, 
+            bob.receive(bcast).await, 
             (
-                msg::Serialized::new(&Err(msg::chain::Error::BadPrev)),
-                None
+                msg::ser(&Err::<msg::ok::Chain,_>(msg::error::Chain::BadPrev)),
+                msg::Bcasts::default()
             )
         );
     }
@@ -355,43 +368,40 @@ pub mod tests {
         let head = { alice.head.lock().await.clone() };
         let evil_alice = Node::new(account::Keypair::default(), head, 0);
         evil_alice.tick().await;
-        evil_alice.receive_txns(
-            msg::txn::Broadcast {
-                txns: Vec::from([
+        evil_alice.receive(
+            msg::Message::Txn(
+                Vec::from([
                     alice.kp.send(
                         bob.kp.kp.public, 
                         1, 
-                        0
+                        state::JENNY_SLOTS
                     )
                 ])
-            }
+            )
         ).await;
         interval.tick().await;
-        let bcast = alice.tick().await.expect("Alice should lead");
-        assert_eq!(bob.tick().await, None);
+        let bcast = msg::deser(&alice.tick().await.pop().expect("Alice should lead"));
+        println!("alice bcast {:?}", bcast);
+        assert_eq!(bob.tick().await, msg::Bcasts::default());
         assert_eq!(
-            bob.receive_chain(bcast.deser()).await, 
-            (
-                msg::Serialized::new(&Ok(())),
-                None
-            )
+            bob.receive(bcast).await.0, 
+            msg::ser(&Ok::<_, msg::error::Chain>(msg::ok::Chain {}))
         );
         interval.tick().await;
-        let bcast = alice.tick().await.expect("Alice should lead");
-        let evil_bcast = evil_alice.tick().await.expect("Alice should lead");
-        assert_eq!(bob.tick().await, None);
+        let bcast = msg::deser(&alice.tick().await.pop().expect("Alice should lead"));
+        println!("alice second bcast {:?}", bcast);
+        let evil_bcast = msg::deser(&evil_alice.tick().await.pop().expect("Alice should lead"));
+        println!("evil alice bcast {:?}", evil_bcast);
+        assert_eq!(bob.tick().await, msg::Bcasts::default());
         assert_eq!(
-            bob.receive_chain(bcast.deser()).await, 
-            (
-                msg::Serialized::new(&Ok(())),
-                None
-            )
+            bob.receive(bcast).await.0, 
+            msg::ser(&Ok::<_, msg::error::Chain>(msg::ok::Chain {}))
         );
         assert_eq!(
-            bob.receive_chain(evil_bcast.deser()).await, 
+            bob.receive(evil_bcast).await, 
             (
-                msg::Serialized::new(&Err(msg::chain::Error::TooShort)),
-                None
+                msg::ser(&Err::<msg::ok::Chain,_>(msg::error::Chain::TooShort)),
+                msg::Bcasts::default()
             )
         );
     }
@@ -401,25 +411,19 @@ pub mod tests {
         let (mut interval, alice, bob) = setup().await;
         interval.tick().await;
         println!("block1 gang {:?}", state::timestamp());
-        let bcast = alice.tick().await.expect("Alice should lead");
-        assert_eq!(bob.tick().await, None);
+        let bcast = msg::deser(&alice.tick().await.pop().expect("Alice should lead"));
+        assert_eq!(bob.tick().await, msg::Bcasts::default());
         assert_eq!(
-            bob.receive_chain(bcast.deser()).await, 
-            (
-                msg::Serialized::new(&Ok(())),
-                None
-            )
+            bob.receive(bcast).await.0, 
+            msg::ser(&Ok::<_, msg::error::Chain>(msg::ok::Chain {}))
         );
         interval.tick().await;
         println!("second");
-        let bcast = alice.tick().await.expect("Alice should lead");
-        assert_eq!(bob.tick().await, None);
+        let bcast = msg::deser(&alice.tick().await.pop().expect("Alice should lead"));
+        assert_eq!(bob.tick().await, msg::Bcasts::default());
         assert_eq!(
-            bob.receive_chain(bcast.deser()).await, 
-            (
-                msg::Serialized::new(&Ok(())),
-                None
-            )
+            bob.receive(bcast).await.0, 
+            msg::ser(&Ok::<_, msg::error::Chain>(msg::ok::Chain {}))
         );
         let mut txns = Vec::default();
         let state = { alice.head.lock().await.state.clone() };
@@ -430,19 +434,16 @@ pub mod tests {
                 state::JENNY_SLOTS
             )
         );
-        alice.receive_txns(
-            msg::txn::Broadcast { txns }
+        alice.receive(
+            msg::Message::Txn(txns)
         ).await;
         interval.tick().await;
         println!("third");
-        let bcast = alice.tick().await.expect("Alice should lead");
-        assert_eq!(bob.tick().await, None);
+        let bcast = msg::deser(&alice.tick().await.pop().expect("Alice should lead"));
+        assert_eq!(bob.tick().await, msg::Bcasts::default());
         assert_eq!(
-            bob.receive_chain(bcast.deser()).await, 
-            (
-                msg::Serialized::new(&Ok(())),
-                None
-            )
+            bob.receive(bcast).await.0, 
+            msg::ser(&Ok::<_, msg::error::Chain>(msg::ok::Chain {}))
         );
         let (mut state, meta) = {
             let head = bob.head.lock().await;
@@ -459,47 +460,39 @@ pub mod tests {
                 ).is_ok()
             );
         }
-        alice.receive_txns(
-            msg::txn::Broadcast { txns }
+        alice.receive(
+            msg::Message::Txn(txns)
         ).await;
         interval.tick().await;
         println!("fourth");
-        let bcast = alice.tick().await.expect("Alice should lead");
-        assert_eq!(bob.tick().await, None);
+        let bcast = msg::deser(&alice.tick().await.pop().expect("Alice should lead"));
+        assert_eq!(bob.tick().await, msg::Bcasts::default());
         assert_eq!(
-            bob.receive_chain(bcast.deser()).await, 
-            (
-                msg::Serialized::new(&Ok(())),
-                None
-            )
+            bob.receive(bcast).await.0, 
+            msg::ser(&Ok::<_, msg::error::Chain>(msg::ok::Chain {}))
         );
         // Now they should lead evenly.
         let mut alice_ctr = 0;
         for _ in 0..25 {
             interval.tick().await;
             println!("looper");
-            match alice.tick().await {
+            match alice.tick().await.pop() {
                 Some(bcast) => {
+                    let bcast = msg::deser(&bcast);
                     println!("alice gang");
                     alice_ctr += 1;
-                    assert_eq!(bob.tick().await, None);
+                    assert_eq!(bob.tick().await, msg::Bcasts::default());
                     assert_eq!(
-                        bob.receive_chain(bcast.deser()).await, 
-                        (
-                            msg::Serialized::new(&Ok(())),
-                            None
-                        )
+                        bob.receive(bcast).await.0, 
+                        msg::ser(&Ok::<_, msg::error::Chain>(msg::ok::Chain {}))
                     );
                 },
                 None => {
                     println!("bob gang");
-                    let bcast = bob.tick().await.expect("Bob should lead");
+                    let bcast = msg::deser(&bob.tick().await.pop().expect("Alice should lead"));
                     assert_eq!(
-                        alice.receive_chain(bcast.deser()).await, 
-                        (
-                            msg::Serialized::new(&Ok(())),
-                            None
-                        )
+                        alice.receive(bcast).await.0, 
+                        msg::ser(&Ok::<_, msg::error::Chain>(msg::ok::Chain {}))
                     );
                 }
             }

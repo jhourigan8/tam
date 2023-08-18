@@ -12,7 +12,7 @@ use crate::validator;
 pub const TXN_BATCH_SIZE: usize = 128;
 pub const MAX_BLOCK_SIZE: usize = 1024;
 
-pub const BLOCK_TIME: u64 = 1_000; // ms
+pub const BLOCK_TIME: u64 = 2_000; // ms
 
 impl Default for Metadata {
     fn default() -> Self {

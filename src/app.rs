@@ -36,24 +36,11 @@ mod handlers {
 
     pub async fn p2p(
         extract::State(client): extract::State<Arc<Client>>,
-        body: String
-    ) {
-        let res: Result<InitMessage, _> = serde_json::from_str(&body);
-        match res {
-            Ok(init) => match init {
-                InitMessage::Txn(t) => {
-                    let (resp, opt_bcast) = client.node.receive_txns(t).await;
-                    if let Some(bcast) = opt_bcast {
-                        client.broadcast(InitMessage::Txn(bcast)).await;
-                    }
-                },
-                InitMessage::Chain(c) => {
-
-                },
-                _ => { panic!("todo") }
-            },
-            _ => { panic!("todo") }
-        }
+        extract::Json(msg): extract::Json<msg::Message>
+    ) -> String {
+        let (resp, bcasts) = client.node.receive(msg).await;
+        client.broadcast(bcasts).await;
+        resp
     }
 
     pub async fn explorer(
@@ -209,8 +196,8 @@ mod handlers {
                                 *nonce
                             );
                             *nonce += 1;
-                            appstate.client.node.receive_txns(
-                                msg::txn::Broadcast{ txns: Vec::from([txn]) }
+                            appstate.client.node.receive(
+                                msg::Message::Txn(Vec::from([txn]))
                             ).await;
                             "Request was successful. Account will be credited in a few seconds.".to_owned()
                         }
@@ -226,15 +213,6 @@ mod handlers {
                 .unwrap()
         )
     }
-}
-
-// The kinds of messages which a client can send to initiate a conversation
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum InitMessage {
-    Txn(msg::txn::Broadcast),
-    Chain(msg::chain::Broadcast),
-    Resync(msg::resync::Request),
-    Batch(msg::batch::Request),
 }
 
 pub struct Client {
@@ -288,8 +266,7 @@ impl Client {
             .route("/", routing::get(handlers::index))
             .route("/faucet.html", routing::get(handlers::faucet))
             .route("/explorer.html", routing::get(handlers::explorer))
-            .route("/p2p/txn", routing::post(handlers::p2p_txn))
-            .route("/p2p/chain", routing::post(handlers::p2p_chain))
+            .route("/p2p", routing::post(handlers::p2p))
             .route("/api/faucet", routing::post(handlers::api_faucet))
             .route("/api/account", routing::get(handlers::api_account))
             .route("/api/account_search", routing::get(handlers::api_account_search))
@@ -301,29 +278,31 @@ impl Client {
         );
         loop {
             interval.tick().await;
-            if let Some(send) = client.node.tick().await {
-                client.broadcast(InitMessage::Chain(send.str)).await;
-            }
+            let bcasts = client.node.tick().await;
+            client.broadcast(bcasts).await;
         }
     }
 
-    pub async fn broadcast(&self, message: InitMessage) {
-        println!("I just bcasted {:?}", message);
-        let ser = serde_json::to_string(&message).unwrap();
-        let neighbs = &*self.neighbors.lock().await;
-        let mut handles = Vec::with_capacity(neighbs.len());
-        for neighbor in neighbs {
-            let client = reqwest::Client::new();
-            println!("sending to {:?}", neighbor);
-            let fut = client
-                .post(format!("http://{}/p2p", neighbor))
-                .body(ser.clone())
-                .send();
-            handles.push(tokio::spawn(fut));
-        }
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            results.push(handle.await.unwrap());
+    pub async fn broadcast(&self, bcasts: msg::Bcasts) {
+        for message in bcasts {
+            println!("I just bcasted {}", message);
+            let neighbs = &*self.neighbors.lock().await;
+            let mut handles = Vec::with_capacity(neighbs.len());
+            for neighbor in neighbs {
+                let client = reqwest::Client::new();
+                println!("sending to {:?}", neighbor);
+                let fut = client
+                    .post(format!("http://{}/p2p", neighbor))
+                    .header("Content-type", "application/json")
+                    .body(message.clone())
+                    .send();
+                handles.push(tokio::spawn(fut));
+            }
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                results.push(handle.await.unwrap());
+            }
+            println!("bcast results {:?}", results);
         }
     }
 }
@@ -349,7 +328,7 @@ mod tests {
         let fut = bob.run("127.0.0.1:3001");
         let bob_fut = tokio::spawn(fut);
 
-        // time::sleep(time::Duration::from_millis(10_000)).await; panic!();
+        time::sleep(time::Duration::from_millis(10_000)).await; panic!();
 
         let _ = alice_fut.await;
         let _ = bob_fut.await;
