@@ -16,7 +16,7 @@ In a relatively weak 1 of N trust model (i.e., we assume at least one validator 
 
  1. **Secure**: __An invalid state transition cannot occur__. If the sequencer posts an invalid transition, the honest validator can tell since they have the transaction batch. So they will post a fraud proof.
  2. **Available**: __All state and transaction history is publicly available__. This is simply because an honest validator will make the transaction and state history public.
- 3. **Censorship-Resistant**: __Anyone can submit a transaction to the L2__. By submitting your transaction to each validator, the honest validator will soon publish it in a batch on the L1, and the sequencer will have to process it.
+ 3. **Censorship Resistant**: __Anyone can submit a transaction to the L2__. By submitting your transaction to each validator, the honest validator will soon publish it in a batch on the L1, and the sequencer will have to process it.
 
 Notice that L1 nodes do not have to verify computations (unless a fraud proof is posted), but they do need to store the entire transaction batches.
 This presents a bottleneck for rollups: the size of transaction data processed by the L2 is necessarily bounded by the bandwidth of the slowest L1 nodes.
