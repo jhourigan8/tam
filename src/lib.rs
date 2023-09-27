@@ -7,3 +7,5 @@ pub mod block;
 pub mod node;
 pub mod app;
 pub mod msg;
+pub mod rollup;
+pub mod senator;

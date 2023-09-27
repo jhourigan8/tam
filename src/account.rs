@@ -6,10 +6,10 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use rand::rngs::OsRng;
 
-use crate::state::{State, VALIDATOR_SLOTS, VALIDATOR_STAKE, VALIDATOR_ROOT};
-use crate::txn::Txn;
+use crate::state::{State, VALIDATOR_SLOTS, VALIDATOR_STAKE};
+use crate::{txn, rollup, merkle, validator};
 
-pub type Account = [u8; 32];
+pub type Id = [u8; 32];
 pub type PublicKey = ed25519_dalek::PublicKey;
 pub type SecretKey = ed25519_dalek::SecretKey;
 pub type Signature = ed25519_dalek::Signature;
@@ -48,71 +48,62 @@ impl Keypair {
         self.kp.sign(&serde_json::to_string(&msg).expect("").as_bytes())
     }
 
-    pub fn send(&self, to: PublicKey, amount: u32, nonce: u32) -> Signed<Txn> {
-        self.send_acc(Sha256::digest(to).into(), amount, nonce)
+    pub fn send(&self, to: PublicKey, amount: u32, nonce: u32, opt_rollup: Option<rollup::Id>) -> Signed<txn::Txn> {
+        self.send_acc(Sha256::digest(to).into(), amount, nonce, opt_rollup)
     }
 
-    pub fn send_acc(&self, to: [u8; 32], amount: u32, nonce: u32) -> Signed<Txn> {
-        let msg = Txn {
-            to,
-            amount,
-            nonce,
-            data: BTreeMap::default()
+    pub fn send_acc(&self, to: [u8; 32], amount: u32, nonce: u32, opt_rollup: Option<rollup::Id>) -> Signed<txn::Txn> {
+        let msg = txn::Txn {
+            payload: txn::Payload::Payment(to, amount),
+            opt_rollup,
+            nonce
         };
         let sig = self.sign(&msg);
-        Signed::<Txn> {
+        Signed::<txn::Txn> {
             msg,
             from: self.kp.public.clone(),
             sig
         }
     }
 
-    pub fn stake(&self, state: &State, nonce: u32) -> Signed<Txn> {
+    pub fn stake(&self, validators: &merkle::Map<validator::Data>, nonce: u32) -> Signed<txn::Txn> {
         let mut rng = rand::thread_rng();
         let idx = loop {
             let rand = rng.gen::<u32>() % VALIDATOR_SLOTS;
-            if state.validators.get(&rand.to_be_bytes()).unwrap().is_none() {
+            if validators.get(&rand.to_be_bytes()).unwrap().is_none() {
                 break rand;
             }
         };
-        let mut data = BTreeMap::default();
-        data.insert(String::from("idx"), Vec::from(idx.to_be_bytes()));
-        data.insert(String::from("method"), b"stake".to_vec());
-        let msg = Txn {
-            to: VALIDATOR_ROOT,
-            amount: VALIDATOR_STAKE,
-            nonce,
-            data
+        let msg = txn::Txn {
+            payload: txn::Payload::Stake(idx.to_be_bytes()),
+            opt_rollup: None,
+            nonce
         };
         let sig = self.sign(&msg);
-        Signed::<Txn> {
+        Signed::<txn::Txn> {
             msg,
             from: self.kp.public.clone(),
             sig
         }
     }
 
-    pub fn unstake(&self, state: &State, nonce: u32) -> Signed<Txn> {
+    pub fn unstake(&self, validators: &merkle::Map<validator::Data>, nonce: u32) -> Signed<txn::Txn> {
         let mut rng = rand::thread_rng();
         let idx = loop {
             let rand = rng.gen::<u32>() % VALIDATOR_SLOTS;
-            if let Some(stake_data) = state.validators.get(&rand.to_be_bytes()).unwrap() {
-                if stake_data.owner == self.kp.public {
+            if let Some(stake_data) = validators.get(&rand.to_be_bytes()).unwrap() {
+                if stake_data.pk == self.kp.public {
                     break rand;
                 }
             }
         };
-        let mut data = BTreeMap::default();
-        data.insert(String::from("idx"), Vec::from(idx.to_be_bytes()));
-        data.insert(String::from("method"), b"unstake".to_vec());
-        let msg = Txn {
-            to: VALIDATOR_ROOT,
-            amount: 0,
-            nonce,
-            data
+        let msg = txn::Txn {
+            payload: txn::Payload::Unstake(idx.to_be_bytes()),
+            opt_rollup: None,
+            nonce
         };
         let sig = self.sign(&msg);
-        Signed::<Txn> {
+        Signed::<txn::Txn> {
             msg,
             from: self.kp.public.clone(),
             sig
@@ -122,10 +113,12 @@ impl Keypair {
 
 impl Default for Keypair {
     fn default() -> Self {
-        Keypair { kp: ed25519_dalek::Keypair {
-            public: PublicKey::from_bytes(&JENNY_PK_BYTES).unwrap(),
-            secret: SecretKey::from_bytes(&JENNY_SK_BYTES).unwrap()
-        } }
+        Keypair { 
+            kp: ed25519_dalek::Keypair {
+                public: PublicKey::from_bytes(&JENNY_PK_BYTES).unwrap(),
+                secret: SecretKey::from_bytes(&JENNY_SK_BYTES).unwrap()
+            } 
+        }
     }
 }
 

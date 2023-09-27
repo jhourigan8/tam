@@ -328,7 +328,7 @@ mod tests {
         let fut = bob.run("127.0.0.1:3001");
         let bob_fut = tokio::spawn(fut);
 
-        time::sleep(time::Duration::from_millis(10_000)).await; panic!();
+        // time::sleep(time::Duration::from_millis(10_000)).await; panic!();
 
         let _ = alice_fut.await;
         let _ = bob_fut.await;

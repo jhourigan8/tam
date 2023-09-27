@@ -1,15 +1,11 @@
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Sha256, Digest};
-use crate::merkle;
-use crate::account;
-use crate::validator;
-use crate::txn;
-use crate::block;
+use crate::{merkle, account, validator, txn, block, senator, rollup};
 
-pub const VALIDATOR_ROOT: account::Account = [0u8; 32];
 pub const VALIDATOR_SLOTS: u32 = 256;
 pub const VALIDATOR_STAKE: u32 = 1024;
 pub const JENNY_COINS: u32 = VALIDATOR_SLOTS * VALIDATOR_STAKE >> 1;
@@ -20,17 +16,38 @@ const _MAX_FORK: u32 = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
+    // Accounts and balances. Indexed by hash of pk.
     pub accounts: merkle::Map<account::Data>,
+    // Validator slots.
+    // One slot is randomly chosen to lead each tick.
+    pub slots: merkle::Map<validator::SlotData>,
+    // Validators who can own any number of slots. Also indexed by hash of pk.
     pub validators: merkle::Map<validator::Data>,
+    // Senators on any rollup. Indexed by hash of pk.
+    pub senators: merkle::Map<senator::Data>,
+    // Arbitrary index?
+    pub rollups: merkle::Map<rollup::Data>,
 }
 
 impl Default for State {
     fn default() -> Self {
         let mut state = Self {
             accounts: merkle::Map::default(),
+            slots: merkle::Map::default(),
             validators: merkle::Map::default(),
+            senators: merkle::Map::default(),
+            rollups: merkle::Map::default()
         };
         let jenny_acc = account::Keypair::default();
+        assert!(
+            state.accounts.insert(
+                &Sha256::digest(jenny_acc.kp.public.to_bytes()),
+                account::Data { 
+                    bal: JENNY_COINS + JENNY_SLOTS * VALIDATOR_STAKE, 
+                    nonce: 0 
+                }
+            ).is_ok()
+        );
         assert!(
             state.accounts.insert(
                 &Sha256::digest(jenny_acc.kp.public.to_bytes()),
@@ -51,7 +68,7 @@ impl Default for State {
         for i in 0..VALIDATOR_SLOTS >> 1 {
             assert!(
                 state.apply(
-                    &jenny_acc.stake(&state, i), 
+                    &jenny_acc.stake(&state.validators, i), 
                     &meta
                 ).is_ok()
             );
@@ -61,8 +78,11 @@ impl Default for State {
 }
 
 pub enum Update {
-    AccountUp(account::Account, Option<account::Data>),
-    ValidatorUp(validator::Slot, Option<validator::Data>)
+    Account(account::Id, Option<account::Data>),
+    Slot(validator::Slot, Option<validator::SlotData>),
+    Validator(validator::Id, Option<validator::Data>),
+    Senator(senator::Id, Option<senator::Data>),
+    Rollup(rollup::Id, Option<rollup::Data>)
 }
 
 impl State {
@@ -80,98 +100,159 @@ impl State {
         } else if from_account.nonce < stxn.msg.nonce {
             return Err(txn::Error::BigNonce);
         }
-        if from_account.bal < stxn.msg.amount {
-            return Err(txn::Error::InsuffBal);
-        }
-        from_account.bal -= stxn.msg.amount;
         from_account.nonce += 1;
-        if stxn.msg.to == VALIDATOR_ROOT {
-            let staking = match stxn.msg.data.get("method") {
-                Some(v) => match &v[..] {
-                    b"stake" => true,
-                    b"unstake" => false,
-                    _ => return Err(txn::Error::BadMethod)
+        let mut ups = Vec::default();
+        match stxn.msg.payload {
+            txn::Payload::Payment(to_id, amount) => {
+                if from_account.bal < amount {
+                    return Err(txn::Error::InsuffBal);
                 }
-                _ => return Err(txn::Error::BadMethod)
-            };
-            let idx: [u8; 4] = match stxn.msg.data.get("idx") {
-                None => Err(txn::Error::BadStakeIdx),
-                Some(idx_bytes) =>
-                    idx_bytes
-                        .clone()
-                        .try_into()
-                        .map_err(|_| txn::Error::BadStakeIdx)
-            }?;
-            if staking {
-                if stxn.msg.amount != VALIDATOR_STAKE {
-                    return Err(txn::Error::InsuffStake);
+                match self.accounts.get(&to_id).map_err(|_| txn::Error::NoPreimage)? {
+                    Some(to_account) => {
+                        let mut to_account = to_account.clone();
+                        if from_addy != to_id {
+                            from_account.nonce += 1;
+                            from_account.bal -= amount;
+                            to_account.bal += amount;
+                            ups.push(
+                                Update::Account(to_id, Some(to_account))
+                            );
+                        }
+                        ups.push(
+                            Update::Account(from_addy, Some(from_account))
+                        );
+                    }
+                    None => {
+                        from_account.nonce += 1;
+                        from_account.bal -= amount;
+                        ups.push(
+                            Update::Account(from_addy, Some(from_account))
+                        );
+                        let to_account = account::Data {
+                            bal: amount,
+                            nonce: 0
+                        };
+                        ups.push(
+                            Update::Account(to_id, Some(to_account))
+                        );
+                    }
                 }
-                if self.validators.get(&idx).map_err(|_| txn::Error::NoPreimage)?.is_some() {
+            },
+            txn::Payload::Stake(slot) => {
+                if from_account.bal < VALIDATOR_STAKE {
+                    return Err(txn::Error::InsuffBal);
+                }
+                if self.slots.get(&slot).map_err(|_| txn::Error::NoPreimage)?.is_some() {
                     return Err(txn::Error::BadStakeIdx);
                 }
-                let val_data = validator::Data { 
+                let slot_data = validator::SlotData { 
                     round: headerdata.round, 
-                    owner: stxn.from.clone()
+                    owner: from_addy
                 };
-                Ok(Vec::from([
-                    Update::AccountUp(from_addy, Some(from_account)),
-                    Update::ValidatorUp(idx, Some(val_data))
-                ]))
-            } else {
-                if stxn.msg.amount != 0 {
-                    return Err(txn::Error::InsuffStake);
+                ups.push(
+                    Update::Slot(slot, Some(slot_data))
+                );
+                let val_data = match self.validators.get(&from_addy).map_err(|_| txn::Error::NoPreimage)? {
+                    Some(val) => {
+                        let mut val = val.clone();
+                        val.slots += 1;
+                        val
+                    },
+                    None => {
+                        validator::Data {
+                            opposed: merkle::Map::default(),
+                            slots: 1,
+                            pk: stxn.from.clone()
+                        }
+                    }
+                };
+                if !val_data.opposed.is_empty() {
+                    return Err(txn::Error::LockedStake)
                 }
-                from_account.bal += VALIDATOR_STAKE;
-                match self.validators.get(&idx).map_err(|_| txn::Error::NoPreimage)? {
+                ups.push(
+                    Update::Validator(from_addy, Some(val_data))
+                );
+            },
+            txn::Payload::Unstake(slot) => {
+                match self.slots.get(&slot).map_err(|_| txn::Error::NoPreimage)? {
                     Some(stake_data) => {
-                        if stake_data.owner != stxn.from {
+                        if stake_data.owner != from_addy {
                             return Err(txn::Error::BadStakeIdx)
                         }
                     }
                     _ => return Err(txn::Error::BadStakeIdx)
                 }
-                Ok(Vec::from([
-                    Update::AccountUp(from_addy, Some(from_account)),
-                    Update::ValidatorUp(idx, None)
-                ]))
-            }
-        } else {
-            match self.accounts.get(&stxn.msg.to).map_err(|_| txn::Error::NoPreimage)? {
-                Some(to_account) => {
-                    let mut to_account = to_account.clone();
-                    if from_addy != stxn.msg.to {
-                        to_account.bal += stxn.msg.amount;
-                    } else {
-                        to_account.nonce += 1;
-                    }
-                    Ok(Vec::from([
-                        Update::AccountUp(from_addy, Some(from_account)),
-                        Update::AccountUp(stxn.msg.to, Some(to_account))
-                    ]))
+                ups.push(
+                    Update::Slot(slot, None)
+                );
+                let mut val = self.validators.get(&from_addy)
+                    .map_err(|_| txn::Error::NoPreimage)?
+                    .unwrap()
+                    .clone();
+                if !val.opposed.is_empty() {
+                    return Err(txn::Error::LockedStake)
                 }
-                None => {
-                    Ok(Vec::from([
-                        Update::AccountUp(from_addy, Some(from_account)),
-                        Update::AccountUp(stxn.msg.to, Some(account::Data { bal: stxn.msg.amount, nonce: 0 }))
-                    ]))
+                if val.slots == 1 {
+                    ups.push(
+                        Update::Validator(from_addy, None)
+                    );
+                } else {
+                    val.slots -= 1;
+                    ups.push(
+                        Update::Validator(from_addy, Some(val))
+                    );
                 }
-            }
+            },
+            txn::Payload::Debit(acc_id, opt_rollup, amount) => {
+                todo!()
+            },
+            txn::Payload::Credit(acc_id, amount) => {
+                todo!()
+            },
+            txn::Payload::Header(rollup, txns) => {
+                todo!()
+            },
+            txn::Payload::Oppose(senator_id) => {
+                todo!()
+            },
+            txn::Payload::Support(senator_id) => {
+                todo!()
+            },
         }
+        Ok(ups)
     }
 
     pub fn apply<'a> (&mut self, stxn: &'a account::Signed<txn::Txn>, headerdata: &block::Metadata) -> Result<(), txn::Error> {
         for up in self.verify(stxn, headerdata)? {
-            match up {
-                Update::AccountUp(addy, opt_acc) => {
-                    match opt_acc {
-                        Some(acc) => self.accounts.insert(&addy, acc).map_err(|_| txn::Error::NoPreimage)?,
+            match up { // TODO lots of boilerplate!
+                Update::Account(addy, opt_data) => {
+                    match opt_data {
+                        Some(data) => self.accounts.insert(&addy, data).map_err(|_| txn::Error::NoPreimage)?,
                         None => self.accounts.remove(&addy).map_err(|_| txn::Error::NoPreimage)?
                     };
                 },
-                Update::ValidatorUp(idx, opt_stake) => {
-                    match opt_stake {
-                        Some(stake) => self.validators.insert(&idx, stake).map_err(|_| txn::Error::NoPreimage)?,
-                        None => self.validators.remove(&idx).map_err(|_| txn::Error::NoPreimage)?
+                Update::Validator(addy, opt_data) => {
+                    match opt_data {
+                        Some(data) => self.validators.insert(&addy, data).map_err(|_| txn::Error::NoPreimage)?,
+                        None => self.validators.remove(&addy).map_err(|_| txn::Error::NoPreimage)?
+                    };
+                },
+                Update::Slot(slot, opt_data) => {
+                    match opt_data {
+                        Some(data) => self.slots.insert(&slot, data).map_err(|_| txn::Error::NoPreimage)?,
+                        None => self.slots.remove(&slot).map_err(|_| txn::Error::NoPreimage)?
+                    };
+                },
+                Update::Senator(addy, opt_data) => {
+                    match opt_data {
+                        Some(data) => self.senators.insert(&addy, data).map_err(|_| txn::Error::NoPreimage)?,
+                        None => self.senators.remove(&addy).map_err(|_| txn::Error::NoPreimage)?
+                    };
+                },
+                Update::Rollup(addy, opt_data) => {
+                    match opt_data {
+                        Some(data) => self.rollups.insert(&addy, data).map_err(|_| txn::Error::NoPreimage)?,
+                        None => self.rollups.remove(&addy).map_err(|_| txn::Error::NoPreimage)?
                     };
                 }
             }
@@ -209,31 +290,31 @@ pub mod tests {
         let charlie = account::Keypair::gen();
         assert!(
             builder.add(
-                alice.send(bob.kp.public, 1 << 15, JENNY_SLOTS)
+                alice.send(bob.kp.public, 1 << 15, JENNY_SLOTS, None)
             )
             .is_ok()
         );
         assert!(
             builder.add(
-                alice.send(charlie.kp.public, 1 << 5, JENNY_SLOTS + 1)
+                alice.send(charlie.kp.public, 1 << 5, JENNY_SLOTS + 1, None)
             )
             .is_ok()
         );
         assert!(
             builder.add(
-                bob.send(charlie.kp.public, 1 << 1, 0)
+                bob.send(charlie.kp.public, 1 << 1, 0, None)
             )
             .is_ok()
         );
         assert!(
             builder.add(
-                charlie.send(bob.kp.public, (1 << 5) + (1 << 1), 0)
+                charlie.send(bob.kp.public, (1 << 5) + (1 << 1), 0, None)
             )
             .is_ok()
         );
         assert!(
             builder.add(
-                alice.send(bob.kp.public, 1 << 8, JENNY_SLOTS + 2)
+                alice.send(bob.kp.public, 1 << 8, JENNY_SLOTS + 2, None)
             )
             .is_ok()
         );
@@ -295,10 +376,12 @@ pub mod tests {
         let bob = account::Keypair::gen();
         // BadFromPk
         let msg = txn::Txn {
-            to: Sha256::digest(alice.kp.public.to_bytes()).into(),
-            amount: 1,
+            payload: txn::Payload::Payment(
+                    Sha256::digest(alice.kp.public.to_bytes()).into(),
+                    1
+                ),
             nonce: 0,
-            data: BTreeMap::default()
+            opt_rollup: None
         };
         assert_eq!(
             builder.add(account::Signed::<txn::Txn> {
@@ -317,10 +400,12 @@ pub mod tests {
         let bob = account::Keypair::gen();
         // BadSig
         let msg = txn::Txn {
-            to: Sha256::digest(bob.kp.public.to_bytes()).into(),
-            amount: 1,
-            nonce: VALIDATOR_SLOTS >> 1,
-            data: BTreeMap::default()
+            payload: txn::Payload::Payment(
+                    Sha256::digest(bob.kp.public.to_bytes()).into(),
+                    1
+                ),
+            nonce: JENNY_SLOTS,
+            opt_rollup: None
         };
         assert_eq!(
             builder.add(account::Signed::<txn::Txn> {
@@ -331,16 +416,20 @@ pub mod tests {
             Err(txn::Error::BadSig)
         );
         let msg = txn::Txn {
-            to: Sha256::digest(bob.kp.public.to_bytes()).into(),
-            amount: 1,
-            nonce: VALIDATOR_SLOTS >> 1,
-            data: BTreeMap::default()
+            payload: txn::Payload::Payment(
+                    Sha256::digest(bob.kp.public.to_bytes()).into(),
+                    1
+                ),
+            nonce: JENNY_SLOTS,
+            opt_rollup: None
         };
         let other_msg = txn::Txn {
-            to: Sha256::digest(bob.kp.public.to_bytes()).into(),
-            amount: 2,
-            nonce: VALIDATOR_SLOTS >> 1,
-            data: BTreeMap::default()
+            payload: txn::Payload::Payment(
+                    Sha256::digest(bob.kp.public.to_bytes()).into(),
+                    2
+                ),
+            nonce: JENNY_SLOTS,
+            opt_rollup: None
         };
         assert_eq!(
             builder.add(account::Signed::<txn::Txn> {
@@ -356,20 +445,16 @@ pub mod tests {
     fn badstakeidx() {
         let (alice, snap) = <(account::Keypair, block::Snap)>::default();
         let mut builder = block::Builder::new(&alice, 1, &snap);
-        let mut data = BTreeMap::default();
-        data.insert(
-            String::from("idx"), 
-            alice.unstake(&builder.state, JENNY_SLOTS).msg.data.get("idx").unwrap().clone()
-        );
-        data.insert(
-            String::from("method"), 
-            b"stake".to_vec()
-        );
+        let unstake = alice.unstake(&builder.state.validators, 0);
+        let slot = if let txn::Payload::Unstake(slot) = unstake.msg.payload {
+            slot
+        } else {
+            panic!("unreachable")
+        };
         let msg = txn::Txn {
-            to: VALIDATOR_ROOT,
-            amount: VALIDATOR_STAKE,
-            nonce: VALIDATOR_SLOTS >> 1,
-            data
+            payload: txn::Payload::Stake(slot),
+            opt_rollup: None,
+            nonce: JENNY_SLOTS
         };
         assert_eq!(
             builder.add(account::Signed::<txn::Txn> {
@@ -379,20 +464,16 @@ pub mod tests {
             }).map_err(|e| e.1), 
             Err(txn::Error::BadStakeIdx)
         );
-        let mut data = BTreeMap::default();
-        data.insert(
-            String::from("idx"), 
-            alice.stake(&builder.state, JENNY_SLOTS).msg.data.get("idx").unwrap().clone()
-        );
-        data.insert(
-            String::from("method"), 
-            b"unstake".to_vec()
-        );
+        let stake = alice.stake(&builder.state.validators, 0);
+        let slot = if let txn::Payload::Stake(slot) = unstake.msg.payload {
+            slot
+        } else {
+            panic!("unreachable")
+        };
         let msg = txn::Txn {
-            to: VALIDATOR_ROOT,
-            amount: 0,
-            nonce: VALIDATOR_SLOTS >> 1,
-            data
+            payload: txn::Payload::Unstake(slot),
+            opt_rollup: None,
+            nonce: JENNY_SLOTS
         };
         assert_eq!(
             builder.add(account::Signed::<txn::Txn> {
@@ -401,56 +482,6 @@ pub mod tests {
                 from: alice.kp.public
             }).map_err(|e| e.1), 
             Err(txn::Error::BadStakeIdx)
-        );
-    }
-
-    #[test]
-    fn badmethod() {
-        let (alice, snap) = <(account::Keypair, block::Snap)>::default();
-        let mut builder = block::Builder::new(&alice, 1, &snap);
-        let mut data = BTreeMap::default();
-        data.insert(
-            String::from("idx"), 
-            alice.stake(&builder.state, JENNY_SLOTS).msg.data.get("idx").unwrap().clone()
-        );
-        let msg = txn::Txn {
-            to: VALIDATOR_ROOT,
-            amount: VALIDATOR_STAKE,
-            nonce: VALIDATOR_SLOTS >> 1,
-            data
-        };
-        assert_eq!(
-            builder.add(account::Signed::<txn::Txn> {
-                msg: msg.clone(),
-                sig: alice.sign(&msg),
-                from: alice.kp.public
-            }).map_err(|e| e.1), 
-            Err(txn::Error::BadMethod)
-        );
-        let (alice, snap) = <(account::Keypair, block::Snap)>::default();
-        let mut builder = block::Builder::new(&alice, 1, &snap);
-        let mut data = BTreeMap::default();
-        data.insert(
-            String::from("idx"), 
-            alice.stake(&builder.state, JENNY_SLOTS).msg.data.get("idx").unwrap().clone()
-        );
-        data.insert(
-            String::from("method"), 
-            b"silly string".to_vec()
-        );
-        let msg = txn::Txn {
-            to: VALIDATOR_ROOT,
-            amount: VALIDATOR_STAKE,
-            nonce: VALIDATOR_SLOTS >> 1,
-            data
-        };
-        assert_eq!(
-            builder.add(account::Signed::<txn::Txn> {
-                msg: msg.clone(),
-                sig: alice.sign(&msg),
-                from: alice.kp.public
-            }).map_err(|e| e.1), 
-            Err(txn::Error::BadMethod)
         );
     }
 
@@ -460,7 +491,7 @@ pub mod tests {
         let mut builder = block::Builder::new(&alice, 1, &snap);
         let bob = account::Keypair::gen();
         assert_eq!(
-            builder.add(alice.send(bob.kp.public, JENNY_COINS + 1, JENNY_SLOTS)).map_err(|e| e.1), 
+            builder.add(alice.send(bob.kp.public, JENNY_COINS + 1, JENNY_SLOTS, None)).map_err(|e| e.1), 
             Err(txn::Error::InsuffBal)
         );
     }
@@ -469,27 +500,10 @@ pub mod tests {
     fn insuffstake() {
         let (alice, snap) = <(account::Keypair, block::Snap)>::default();
         let mut builder = block::Builder::new(&alice, 1, &snap);
-        let mut data = BTreeMap::default();
-        data.insert(
-            String::from("idx"), 
-            alice.stake(&builder.state, JENNY_SLOTS).msg.data.get("idx").unwrap().clone()
-        );
-        data.insert(
-            String::from("method"), 
-            b"stake".to_vec()
-        );
-        let msg = txn::Txn {
-            to: VALIDATOR_ROOT,
-            amount: VALIDATOR_STAKE - 1,
-            nonce: JENNY_SLOTS,
-            data
-        };
+        let bob = account::Keypair::gen();
+        let txn = bob.stake(&builder.state.validators, 0);
         assert_eq!(
-            builder.add(account::Signed::<txn::Txn> {
-                msg: msg.clone(),
-                sig: alice.sign(&msg),
-                from: alice.kp.public
-            }).map_err(|e| e.1), 
+            builder.add(txn).map_err(|e| e.1), 
             Err(txn::Error::InsuffStake)
         );
     }
@@ -500,10 +514,10 @@ pub mod tests {
         let mut builder = block::Builder::new(&alice, 1, &snap);
         let bob = account::Keypair::gen();
         assert!(
-            builder.add(alice.send(bob.kp.public, 1, JENNY_SLOTS)).is_ok()
+            builder.add(alice.send(bob.kp.public, 1, JENNY_SLOTS, None)).is_ok()
         );
         assert_eq!(
-            builder.add(alice.send(bob.kp.public, 1, JENNY_SLOTS)).map_err(|e| e.1), 
+            builder.add(alice.send(bob.kp.public, 1, JENNY_SLOTS, None)).map_err(|e| e.1), 
             Err(txn::Error::SmallNonce)
         );
     }
@@ -515,10 +529,10 @@ pub mod tests {
         let bob = account::Keypair::gen();
         let mut old = builder.clone();
         assert!(
-            builder.add(alice.send(bob.kp.public, 1, JENNY_SLOTS)).is_ok()
+            builder.add(alice.send(bob.kp.public, 1, JENNY_SLOTS, None)).is_ok()
         );
         assert_eq!(
-            old.add(alice.send(bob.kp.public, 1, JENNY_SLOTS + 1)).map_err(|e| e.1), 
+            old.add(alice.send(bob.kp.public, 1, JENNY_SLOTS + 1, None)).map_err(|e| e.1), 
             Err(txn::Error::BigNonce)
         );
     }

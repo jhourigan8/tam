@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::mem;
@@ -6,6 +7,8 @@ use serde::{Serialize, Deserialize};
 use tokio::sync::Mutex;
 use std::fmt::Debug;
 
+use crate::rollup;
+use crate::senator;
 use crate::{block, state, txn, account, app, msg};
 
 
@@ -25,6 +28,8 @@ pub struct Node { // TODO: acquire locks in total order so we never deadcock
     pub head: Mutex<block::Snap>, // largest round valid block received in correct time window
     pub opt_builder: Mutex<Option<block::Builder>>,
     pub txpool: Mutex<BTreeSet<account::Signed<txn::Txn>>>, // cached txns
+    pub rollups: Mutex<BTreeSet<rollup::State>>, // rollups we are working on
+    pub reputations: Mutex<BTreeMap<senator::Id, ()>> // TODO this is a thing we should have doe
 }
 
 impl Node {

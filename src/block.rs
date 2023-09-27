@@ -142,7 +142,12 @@ impl Default for Snap {
 
 impl Snap {
     pub fn leader(&self, proposal: u32) -> Result<&account::PublicKey, txn::Error> {
-        validator::leader(&self.block.sheader.msg.data.seed, &self.state.validators, proposal)
+        validator::leader(
+            &self.block.sheader.msg.data.seed, 
+            &self.state.slots, 
+            &self.state.validators, 
+            proposal
+        )
     }
 }
 
@@ -328,18 +333,14 @@ pub mod tests {
         let bob = account::Keypair::gen();
         let mut vec = Vec::default();
         for i in 0..128 {
-            let txn = txn::Txn {
-                to: bob.kp.public.to_bytes(),
-                amount: 1, 
-                nonce: i + state::JENNY_SLOTS,
-                data: BTreeMap::default()
-            };
-            let sig = alice.sign(&txn);
-            vec.push(account::Signed::<txn::Txn> {
-                msg: txn,
-                from: alice.kp.public,
-                sig
-            });
+            vec.push(
+                alice.send(
+                    bob.kp.public,
+                    1,
+                    i + state::JENNY_SLOTS,
+                    None
+                )
+            );
         }
         (alice, bob, vec)
     }
@@ -455,7 +456,8 @@ pub mod tests {
         let bad = alice.send(
             bob.kp.public, 
             state::VALIDATOR_STAKE * state::VALIDATOR_SLOTS, 
-            state::JENNY_SLOTS + 128
+            state::JENNY_SLOTS + 128,
+            None
         );
         assert_eq!(builder.txnseq.insert(&[0u8], bad.clone()), Ok(None));
         let block = builder.finalize(&alice).block;

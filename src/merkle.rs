@@ -577,6 +577,10 @@ impl<V: Serialize + Clone> Map<V> {
     pub fn valid_commits(&self) -> Result<(), ()> {
         self.root.valid_commits()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.root.iter().next().is_some()
+    }
 }
 
 #[cfg(test)]
