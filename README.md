@@ -27,7 +27,7 @@ For guarantees (1) and (3) to hold, we don't precisely need that transaction bat
 Concretely, it suffices for the sequencer / a validator to prove to the L1 that the batch is made available to all other validators: an honest validator is still able to track the state, and the sequencer is still able to include the set of transactions posted by a validator.
 A protocol to do this should have the following properties:
 
- - If a malicious validator posts commit(x) on the L1 and does not make x available to other validators, the L1 nodes can tell and penalize the nalicious validator.
+ - If a malicious validator posts commit(x) on the L1 and does not make x available to other validators, the L1 nodes can tell and penalize the malicious validator.
  - If a malicious validator posts commit(x) on the L1 and tries to make a value y =/= x available, the other validators can efficiently prove that this is the case and the malicious validator is penalized.
  - If a validator posts commit(x) and makes x available, they cannot be penalized.
 
@@ -56,12 +56,12 @@ So this protocol has all the properties we desire.
 ## efficiency, and an optimization
 
 With the sharing scheme, an L1 node with 1/1000 of the stake has to receive and send about 1/1000 of the transaction batch size.
-So compared to a standard optimistic rollup, the size of transaction batches can now bounded by the bandwidth of __all__ L1 nodes, rather than by each L1 node.
+So compared to a standard optimistic rollup, the size of transaction batches are now bounded by the bandwidth of __all__ L1 nodes, rather than by each L1 node.
 On an L1 with 1000 nodes, this represents a potential ~1000x speedup.
+
 The efficiency when things go wrong is a bit worse.
 Each L1 node may complain about each validator, but so long as complaints are not repeated frequently the cost of this is relatively low.
-
-If a validator receives y =/= x, they need to post all sharings on the L1, which is tantamount to posting the whole batch x itself.
+If a validator receives y =/= x, they need to post all shares on the L1, which is tantamount to posting the whole batch x itself.
 Since we wish to allow x to be very large, this is not ideal.
 A moderatley complex fix is the following: instead of sharing x, the validator shares many nodes in a merkle tree encoding x, each of far smaller size than x itself (e.g., each of size Theta(# of L1 nodes), so each share is constant size).
 If this was done incorrectly, then at most two merkle nodes need to be posted and reconstructed on the L1 to prove this is the case.
