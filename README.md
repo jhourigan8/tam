@@ -7,7 +7,7 @@ Early stage code exploring a potential optimization in optimistic rollups.
 Optimistic rollups are a particular kind of solution to the scaling bottlenecks faced by L1 blockchains.
 Although implementations can vary, the following is a relatively representative concrete protocol.
 
- - There is a 1 **sequencer** node who periodically processes transactions for the L2 and posts the transaction batch (often significantly compressed) + new state root on the L1.
+ - There is 1 **sequencer** node who periodically processes transactions for the L2 and posts the transaction batch (often significantly compressed) + new state root on the L1.
  - There are N ~= 10 **validator** nodes who have the rollup state. They make this publicly available to anyone who requests it.
  - The validators read the transaction batches and verify the state transition; if incorrect, they post a succinct **fraud proof** showing that the state transition was computed incorrectly. If the fraud proof is correct, the sequencer will have their state slashed, a new validator will be chosen as sequencer, and the incorrect transition will be reverted.
  - Validators regularly post unprocessed transaction batches that they receive on the L1. The sequencer is required to process these in a timely manner or else they will be slashed.
