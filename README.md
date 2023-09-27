@@ -25,7 +25,7 @@ This presents a bottleneck for rollups: the size of transaction data processed b
 
 For guarantees (1) and (3) to hold, we don't precisely need that transaction batches are posted on the L1.
 Concretely, it suffices for the sequencer / a validator to prove to the L1 that the batch is made available to all other validators: an honest validator is still able to track the state, and the sequencer is still able to include the set of transactions posted by a validator.
-Then our protocol should have the following properties:
+A protocol to do this should have the following properties:
 
  - If a malicious validator posts commit(x) on the L1 and does not make x available to other validators, the L1 nodes can tell and penalize the nalicious validator.
  - If a malicious validator posts commit(x) on the L1 and tries to make a value y =/= x available, the other validators can efficiently prove that this is the case and the malicious validator is penalized.
